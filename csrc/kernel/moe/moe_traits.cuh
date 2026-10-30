@@ -26,18 +26,18 @@
 
 namespace halops::moe {
 
-// The quantization of one matrix.  `Size` is the scale group (or block)
+// The quantization of one matrix.  `BlockSize` is the scale group (or block)
 // width; MXFP8 and MXFP4 have a fixed 32-element group, so their
 // specialization ignores it.  ScaleShape<M, N>() is the scale tensor's
 // cute::Shape for an [M, N] matrix (N is the logical reduction K).
-template <QuantMode Mode,
-          std::uint32_t Size = (Mode == QuantMode::kBlockwiseFP8 ? 128u : 32u)>
+template <QuantMode Mode, std::uint32_t BlockSize =
+                              (Mode == QuantMode::kBlockwiseFP8 ? 128u : 32u)>
 struct QuantTraits;
 
-template <std::uint32_t Size>
-struct QuantTraits<QuantMode::kBlockwiseFP8, Size> {
-    static constexpr QuantMode Method = QuantMode::kBlockwiseFP8;
-    static constexpr std::uint32_t BlockSize = Size;
+template <std::uint32_t BlockSize>
+struct QuantTraits<QuantMode::kBlockwiseFP8, BlockSize> {
+    static constexpr QuantMode kMethod = QuantMode::kBlockwiseFP8;
+    static constexpr std::uint32_t kBlockSize = BlockSize;
     using ElementType = __nv_fp8_e4m3;
     using ScaleType = float;
 
@@ -48,10 +48,10 @@ struct QuantTraits<QuantMode::kBlockwiseFP8, Size> {
     }
 };
 
-template <std::uint32_t Size>
-struct QuantTraits<QuantMode::kMXFP8, Size> {
-    static constexpr QuantMode Method = QuantMode::kMXFP8;
-    static constexpr std::uint32_t BlockSize = 32u;  // fixed for MX
+template <std::uint32_t BlockSize>
+struct QuantTraits<QuantMode::kMXFP8, BlockSize> {
+    static constexpr QuantMode kMethod = QuantMode::kMXFP8;
+    static constexpr std::uint32_t kBlockSize = 32u;
     using ElementType = __nv_fp8_e4m3;
     using ScaleType = std::uint8_t;
 
@@ -63,11 +63,11 @@ struct QuantTraits<QuantMode::kMXFP8, Size> {
     }
 };
 
-template <std::uint32_t Size>
-struct QuantTraits<QuantMode::kMXFP4, Size> {
-    static constexpr QuantMode Method = QuantMode::kMXFP4;
-    static constexpr std::uint32_t BlockSize = 32u;  // fixed for MX
-    using ElementType = std::uint8_t;                // two FP4 values per byte
+template <std::uint32_t BlockSize>
+struct QuantTraits<QuantMode::kMXFP4, BlockSize> {
+    static constexpr QuantMode kMethod = QuantMode::kMXFP4;
+    static constexpr std::uint32_t kBlockSize = 32u;
+    using ElementType = std::uint8_t;  // two FP4 values per byte
     using ScaleType = std::uint8_t;
 
     template <std::uint32_t M, std::uint32_t N>
@@ -126,7 +126,7 @@ struct LatentDownGemmTraits {
     // MXFP8 latent: UE8M0 scales, one per 32-K block, applied by the HMMA
     // path per instruction.  The UMMA path is not wired for it yet.
     using Quant = QuantTraits<Dims::kLatentQuant>;
-    static constexpr bool kMXFP8 = Quant::Method == QuantMode::kMXFP8;
+    static constexpr bool kMXFP8 = Quant::kMethod == QuantMode::kMXFP8;
     using ScaleElement = typename Quant::ScaleType;
     static constexpr std::uint32_t kMxScaleBlocksK = static_cast<std::uint32_t>(
         cute::get<1>(Quant::template ScaleShape<kGemmM, kGemmK>()));

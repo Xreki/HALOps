@@ -23,7 +23,7 @@ from halops import (
     low_latency_moe,
     transform_weights_for_moe,
 )
-from halops.moe.low_latency_moe import _quantize_latent
+from halops.moe.low_latency_moe import _normalize_quant_mode, _quantize_latent
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
 
@@ -63,7 +63,7 @@ def _quant_fp8_per_token(x, block_size=128):
 class MoEParams:
     """One `low_latency_moe` call: the knobs, plus the operands `init_weights` fills."""
 
-    def __init__(self, use_latent=True, activation="silu"):
+    def __init__(self, use_latent=True, activation="silu", quant_mode="w8a8-blockwise"):
         self.hidden_size = 4096
         self.intermediate_size = 512
         self.latent_size = 2048
@@ -75,6 +75,8 @@ class MoEParams:
         self.activation = activation
         self.situ_beta = 4.0
         self.situ_linear_beta = 25.0
+        self.quant_mode = quant_mode
+        self.latent_quant = _normalize_quant_mode(quant_mode)["latent_down"]
         self.init_weights()
 
     def init_weights(self, *, seed: int = 0, device=None):
@@ -95,14 +97,22 @@ class MoEParams:
         w2, s2 = _quant_fp8_block_wise(
             torch.randn(e, z, n, device=dev, generator=g) * 0.1
         )
-        latent_w = latent_s = latent_w_bf16 = None
+        latent_w = latent_s = None
+        latent_is_packed = False
         if self.use_latent:
-            # The kernel reads [L, H], so the scales are transposed.
             raw = torch.randn(1, h, z, device=dev, generator=g) * 0.1
-            lw, ls = _quant_fp8_block_wise(raw)
-            latent_w_bf16 = raw[0].bfloat16()
-            latent_w = lw[0]
-            latent_s = ls[0].t().contiguous()
+            if self.latent_quant == "w8a8-mxfp8":
+                # A 1x32 scale grid cannot be transposed, so quantize the
+                # already-transposed weight and hand over the kernel layout.
+                latent_w, latent_s = _quantize_latent(
+                    raw[0].bfloat16(), self.latent_quant
+                )
+                latent_is_packed = True
+            else:
+                # The kernel reads [L, H], so the scales are transposed.
+                lw, ls = _quant_fp8_block_wise(raw)
+                latent_w = lw[0]
+                latent_s = ls[0].t().contiguous()
 
         self.router_weight = router
         self.expert_up_weights = w13
@@ -111,7 +121,7 @@ class MoEParams:
         self.expert_down_weights_scale = s2
         self.latent_down_weight = latent_w
         self.latent_down_weight_scale = latent_s
-        self.latent_down_weight_bf16 = latent_w_bf16
+        self.latent_weight_is_packed = latent_is_packed
 
         shared_up, shared_up_s = _quant_fp8_block_wise(
             torch.randn(1, 2 * n, h, device=dev, generator=g) * 0.1
@@ -313,17 +323,35 @@ class MoERef:
                 )
         return out.bfloat16()
 
+    def _latent_down(self, input):
+        """z = x @ W_latent^T in the recipe the latent group runs."""
+        p = self.moe_params
+        if p.latent_quant == "w8a8-mxfp8":
+            xq, x_scale = _quant_mxfp8_activation(input)
+            w_scale = _sf_to_plain(
+                p.latent_down_weight_scale, p.latent_size, p.hidden_size // 32
+            )
+            xf = (xq.reshape(xq.shape[0], -1, 32) * x_scale[..., None]).reshape(
+                xq.shape
+            )
+            wf = (
+                p.latent_down_weight.float().reshape(p.latent_size, -1, 32)
+                * w_scale[..., None]
+            ).reshape(p.latent_size, p.hidden_size)
+            return (xf.bfloat16() @ wf.bfloat16().T).bfloat16()
+
+        # z = x @ W_latent^T; the [L/128, H/128] scales transpose onto [H, L].
+        weight = p.latent_down_weight.float()
+        scale = p.latent_down_weight_scale
+        dequant = weight * scale.T.repeat_interleave(128, 0).repeat_interleave(128, 1)
+        return (input.bfloat16() @ dequant.bfloat16()).bfloat16()
+
     def __call__(self, input, top_k):
         shared_out = self._shared_expert(input)
 
         scores = _router_scores(self._router_logits(input))
         topk_w, topk_ids = _routing_sigmoid_topk_from_scores(scores, top_k)
-
-        # z = x @ W_latent^T; the [L/128, H/128] scales transpose onto [H, L].
-        weight = self.moe_params.latent_down_weight.float()
-        scale = self.moe_params.latent_down_weight_scale
-        dequant = weight * scale.T.repeat_interleave(128, 0).repeat_interleave(128, 1)
-        latent_out = (input.bfloat16() @ dequant.bfloat16()).bfloat16()
+        latent_out = self._latent_down(input)
 
         routed_out = self.routed_experts(
             latent_out,
@@ -334,38 +362,6 @@ class MoERef:
             topk_w,
             topk_ids,
             self.moe_params.intermediate_size,
-            latent_out.shape[1],
-        )
-        return routed_out, shared_out
-
-
-class MoERefMxLatent(MoERef):
-    """``MoERef`` with the latent down-projection quantized as MXFP8."""
-
-    def __call__(self, input, top_k, latent_w_mx, latent_scale_sf):
-        shared_out = self._shared_expert(input)
-
-        scores = _router_scores(self._router_logits(input))
-        topk_w, topk_ids = _routing_sigmoid_topk_from_scores(scores, top_k)
-
-        p = self.moe_params
-        xq, x_scale = _quant_mxfp8_activation(input)
-        w_scale = _sf_to_plain(latent_scale_sf, p.latent_size, p.hidden_size // 32)
-        xf = (xq.reshape(xq.shape[0], -1, 32) * x_scale[..., None]).reshape(xq.shape)
-        wf = (
-            latent_w_mx.float().reshape(p.latent_size, -1, 32) * w_scale[..., None]
-        ).reshape(p.latent_size, p.hidden_size)
-        latent_out = (xf.bfloat16() @ wf.bfloat16().T).bfloat16()
-
-        routed_out = self.routed_experts(
-            latent_out,
-            p.expert_up_weights,
-            p.expert_up_weights_scale,
-            p.expert_down_weights,
-            p.expert_down_weights_scale,
-            topk_w,
-            topk_ids,
-            p.intermediate_size,
             latent_out.shape[1],
         )
         return routed_out, shared_out
@@ -382,14 +378,26 @@ class MoEFused:
     def __call__(self, input, top_k):
         num_tokens = input.size(0)
         if self.packed_weights is None:
+            # An MXFP8 latent weight is already in the kernel layout; only the
+            # block-wise one goes through the transpose packer.
+            latent_to_pack = (
+                None
+                if self.moe_params.latent_weight_is_packed
+                else self.moe_params.latent_down_weight
+            )
             self.packed_weights = transform_weights_for_moe(
                 self.moe_params.router_weight,
                 self.moe_params.expert_up_weights,
                 self.moe_params.shared_up_weight,
-                self.moe_params.latent_down_weight,
+                latent_to_pack,
                 num_tokens,
                 self.moe_params.num_router_gates,
             )
+        latent_weight = (
+            self.moe_params.latent_down_weight
+            if self.moe_params.latent_weight_is_packed
+            else self.packed_weights.get("latent_down_weight")
+        )
 
         if self.workspace is None:
             self.workspace = get_workspace_for_moe(input)
@@ -417,7 +425,7 @@ class MoEFused:
             self.moe_params.shared_up_weight_scale,
             self.moe_params.shared_down_weight,
             self.moe_params.shared_down_weight_scale,
-            self.packed_weights.get("latent_down_weight"),
+            latent_weight,
             self.moe_params.latent_down_weight_scale,
             self.workspace,
             routed_out,
@@ -429,6 +437,7 @@ class MoEFused:
             self.moe_params.activation,
             self.moe_params.situ_beta,
             self.moe_params.situ_linear_beta,
+            self.moe_params.quant_mode,
         )
         return routed_out, shared_out
 
@@ -446,25 +455,8 @@ def _router_scores(logits):
     return scores.sum(0) if scores.dim() == 3 else scores
 
 
-def _make_weights(dev, E, N, K, scale=0.1, seed=42):
-    """Quantized block-FP8 up/down weights (fp8 tensors + scales) for a shape."""
-    g = torch.Generator(device=dev).manual_seed(seed)
-    w13_f = torch.randn(E, 2 * N, K, device=dev, generator=g) * scale
-    w2_f = torch.randn(E, K, N, device=dev, generator=g) * scale
-    w13_fp8, s13 = _quant_fp8_block_wise(w13_f)
-    w2_fp8, s2 = _quant_fp8_block_wise(w2_f)
-    return w13_fp8, s13, w2_fp8, s2
-
-
-def _router_weight(dev, K, E, x_std=1.0, seed=0):
-    """Random bf16 router Linear weight ``[K, E]`` giving unit-variance logits."""
-    g = torch.Generator(device=dev).manual_seed(seed)
-    w = torch.randn(K, E, device=dev, generator=g) / (x_std * K**0.5)
-    return w.bfloat16()
-
-
 def _run_and_compare(moe_params, num_tokens=1, top_k=8):
-    """Run moe against the block-FP8 reference; return (cos routed, cos shared)."""
+    """Run moe against the reference recipe; return (cos routed, cos shared)."""
     dev = torch.device("cuda")
     input = torch.randn(
         num_tokens, moe_params.hidden_size, device=dev, dtype=torch.bfloat16
@@ -494,70 +486,21 @@ def test_moe_accuracy(num_tokens, top_k, activation):
     assert cos_shared > 0.98, f"cosine similarity too low: {cos_shared:.5f}"
 
 
-def test_moe_latent_mxfp8_accuracy():
-    top_k, num_tokens = 8, 8
-    dev = torch.device("cuda")
-    moe_params = MoEParams(use_latent=True)
-    moe_params.init_weights()
-    input = torch.randn(
-        num_tokens, moe_params.hidden_size, device=dev, dtype=torch.bfloat16
+@pytest.mark.parametrize("num_tokens", [1, 8])
+def test_mxfp8_moe_accuracy(num_tokens):
+    """The latent down-projection runs as MXFP8; the other groups stay block-wise."""
+    top_k = 8
+    moe_params = MoEParams(
+        use_latent=True,
+        quant_mode={"latent_down": "w8a8-mxfp8", "default": "w8a8-blockwise"},
     )
-
-    packed = transform_weights_for_moe(
-        moe_params.router_weight,
-        moe_params.expert_up_weights,
-        moe_params.shared_up_weight,
-        moe_params.latent_down_weight,
-        num_tokens,
-        moe_params.num_router_gates,
-    )
-    latent_w_mx, latent_s_mx = _quantize_latent(
-        moe_params.latent_down_weight_bf16, "w8a8-mxfp8"
-    )
-
-    workspace = get_workspace_for_moe(input)
-    routed_out = torch.zeros(
-        num_tokens, moe_params.latent_size, dtype=torch.bfloat16, device=dev
-    )
-    shared_out = torch.zeros(
-        num_tokens, moe_params.hidden_size, dtype=torch.bfloat16, device=dev
-    )
-    low_latency_moe(
-        input,
-        packed["router_weight"],
-        packed["expert_up_weights"],
-        moe_params.expert_up_weights_scale,
-        moe_params.expert_down_weights,
-        moe_params.expert_down_weights_scale,
-        packed["shared_up_weight"],
-        moe_params.shared_up_weight_scale,
-        moe_params.shared_down_weight,
-        moe_params.shared_down_weight_scale,
-        latent_w_mx,
-        latent_s_mx,
-        workspace,
-        routed_out,
-        shared_out,
-        top_k,
-        moe_params.num_router_gates,
-        moe_params.scoring_func,
-        moe_params.renormalize,
-        moe_params.activation,
-        moe_params.situ_beta,
-        moe_params.situ_linear_beta,
-        {"latent_down": "w8a8-mxfp8", "default": "w8a8-blockwise"},
-    )
-
-    ref = MoERefMxLatent(moe_params)
-    routed_ref, shared_ref = ref(input, top_k, latent_w_mx, latent_s_mx)
-    cos = _cosine(routed_out, routed_ref)
-    cos_shared = _cosine(shared_out, shared_ref)
+    cos_routed, cos_shared = _run_and_compare(moe_params, num_tokens, top_k)
     print(
-        f"\n[moe mxfp8 latent] m={num_tokens} top_k={top_k}: "
-        f"cos={cos:.5f}, {cos_shared:.5f}"
+        f"\n[moe mxfp8 latent] num_tokens={num_tokens} top_k={top_k}: "
+        f"cos_sim={cos_routed:.5f}, {cos_shared:.5f}"
     )
-    assert cos > 0.98, f"routed cos too low: {cos:.5f}"
-    assert cos_shared > 0.98, f"shared cos too low: {cos_shared:.5f}"
+    assert cos_routed > 0.98, f"cosine similarity too low: {cos_routed:.5f}"
+    assert cos_shared > 0.98, f"cosine similarity too low: {cos_shared:.5f}"
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])

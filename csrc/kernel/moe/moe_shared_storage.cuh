@@ -381,7 +381,7 @@ struct QuantizedActivationSmem {
     static constexpr std::uint32_t kNumLboChunksK = TileShapeK / kLboChunkK;
     // The activation scale group width: the caller's group for group-wise
     // recipes (128, or 64 for the shared expert's up output); fixed for MX.
-    static constexpr std::uint32_t kScaleGroupK = Quant::BlockSize;
+    static constexpr std::uint32_t kScaleGroupK = Quant::kBlockSize;
     static constexpr std::uint32_t kScaleGroups = GemmK / kScaleGroupK;
 
     static_assert(TileShapeK % kLboChunkK == 0u,
