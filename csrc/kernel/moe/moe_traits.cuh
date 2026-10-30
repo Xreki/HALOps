@@ -22,9 +22,62 @@
 
 #include "mma_core.cuh"
 #include "moe_configs.cuh"
+#include "moe_interface.h"
 #include "ptx_utils.cuh"
 
 namespace halops::moe {
+
+// The quantization of one matrix.  `Size` is the scale group (or block)
+// width; MXFP8 and MXFP4 have a fixed 32-element group, so their
+// specialization ignores it.  ScaleShape<M, N>() is the scale tensor's
+// cute::Shape for an [M, N] matrix (N is the logical reduction K).
+template <QuantMode Mode,
+          std::uint32_t Size = (Mode == QuantMode::kBlockwiseFP8 ? 128u : 32u)>
+struct QuantTraits;
+
+template <std::uint32_t Size>
+struct QuantTraits<QuantMode::kBlockwiseFP8, Size> {
+    static constexpr QuantMode Method = QuantMode::kBlockwiseFP8;
+    static constexpr std::uint32_t BlockSize = Size;
+    using ElementType = __nv_fp8_e4m3;
+    using ScaleType = float;
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr auto ScaleShape() {
+        return cute::make_shape(cute::Int<(M + BlockSize - 1u) / BlockSize>{},
+                                cute::Int<(N + BlockSize - 1u) / BlockSize>{});
+    }
+};
+
+template <std::uint32_t Size>
+struct QuantTraits<QuantMode::kMXFP8, Size> {
+    static constexpr QuantMode Method = QuantMode::kMXFP8;
+    static constexpr std::uint32_t BlockSize = 32u;  // fixed for MX
+    using ElementType = __nv_fp8_e4m3;
+    using ScaleType = std::uint8_t;
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr auto ScaleShape() {
+        static_assert(N % BlockSize == 0u,
+                      "K must be whole 32-element scale groups");
+        return cute::make_shape(cute::Int<M>{}, cute::Int<N / BlockSize>{});
+    }
+};
+
+template <std::uint32_t Size>
+struct QuantTraits<QuantMode::kMXFP4, Size> {
+    static constexpr QuantMode Method = QuantMode::kMXFP4;
+    static constexpr std::uint32_t BlockSize = 32u;  // fixed for MX
+    using ElementType = std::uint8_t;                // two FP4 values per byte
+    using ScaleType = std::uint8_t;
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr auto ScaleShape() {
+        static_assert(N % BlockSize == 0u,
+                      "K must be whole 32-element scale groups");
+        return cute::make_shape(cute::Int<M>{}, cute::Int<N / BlockSize>{});
+    }
+};
 
 // Tile shape shared by the router Linear and the latent down-projection.
 template <std::uint32_t GemmM, std::uint32_t GemmN, std::uint32_t GemmK,
@@ -70,6 +123,16 @@ struct LatentDownGemmTraits {
 
     static constexpr bool kUseUmma =
         LatentDownMmaKind<Dims>::value == MmaKind::kUmma;
+
+    // MXFP8 latent: UE8M0 scales, one per 32-K block, applied by the HMMA
+    // path per instruction.  The UMMA path is not wired for it yet.
+    using Quant = QuantTraits<Dims::kLatentQuant>;
+    static constexpr bool kMXFP8 = Quant::Method == QuantMode::kMXFP8;
+    using ScaleElement = typename Quant::ScaleType;
+    static constexpr std::uint32_t kMxScaleBlocksK = static_cast<std::uint32_t>(
+        cute::get<1>(Quant::template ScaleShape<kGemmM, kGemmK>()));
+    static_assert(!kMXFP8 || !kUseUmma,
+                  "MXFP8 latent only supports the HMMA schedule");
 
     static constexpr std::uint32_t kNumCtas = NumCtasForLatentDown<Dims>::value;
     static constexpr std::uint32_t kTileShapeN = 8u;

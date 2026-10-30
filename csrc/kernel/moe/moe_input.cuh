@@ -31,16 +31,16 @@ namespace halops::moe {
 
 // Issue the full per-block BF16 input TMA load: one 64-k SW128 box per
 // issue, box `kk` into `dest[kk]`.
-template <std::size_t kRingRows, std::size_t NumSwizzleBoxesK,
+template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
           std::size_t SwizzleBoxK>
 __device__ __forceinline__ void load_input_tile(
     CUtensorMap const& tma_input_desc, std::uint32_t tile,
     std::uint32_t token_start,
-    DataType::ElementA (&dest)[NumSwizzleBoxesK][kRingRows][SwizzleBoxK],
+    DataType::ElementA (&dest)[NumSwizzleBoxesK][NumRows][SwizzleBoxK],
     std::uint64_t* bar_smem_ptr) {
     // The box is one 8-row swizzle atom, so the ring's rows are whole atoms.
-    constexpr std::uint32_t kRowGroups = kRingRows / 8u;
-    static_assert(kRingRows % 8u == 0u, "the ring is whole swizzle atoms");
+    constexpr std::uint32_t kRowGroups = NumRows / 8u;
+    static_assert(NumRows % 8u == 0u, "the ring is whole swizzle atoms");
 #pragma unroll
     for (std::uint32_t kk = 0u; kk < NumSwizzleBoxesK; ++kk) {
 #pragma unroll
@@ -144,36 +144,136 @@ __device__ __forceinline__ void moe_streaming_quantize_k128(
                              quantized_input_scale_for_step);
 }
 
-template <bool Staged, std::size_t kRingRows, std::size_t kScaleCols,
-          std::size_t NumCols, std::size_t SwizzleBoxK, std::size_t QuantBlock,
-          std::size_t NumQuantBlocks, std::size_t kBlocksPerSlot>
-__device__ inline void quantize_fp8_blockwise_128(
+// NumRows / NumCols are the tile's token rows and K extent; ScaleCols is the
+// scale table's token stride (the whole activation's token count).
+template <bool Staged, std::size_t NumRows, std::size_t NumCols,
+          std::size_t ScaleCols, std::size_t QuantBlock,
+          std::size_t SwizzleBoxK, std::size_t BlocksPerStage>
+__device__ inline void quantize_mxfp8_groupwise_1x32(
     const DataType::ElementA* __restrict__ src, std::uint32_t k_base,
     DataType::ElementQA (*__restrict__ quantized_input)[QuantBlock *
-                                                        kBlocksPerSlot / 16u]
-                                                       [kRingRows + 1u][16u],
+                                                        BlocksPerStage / 16u]
+                                                       [NumRows + 1u][16u],
+    std::uint8_t* __restrict__ quantized_input_scale,
+    std::uint32_t staging_slot_base, std::uint32_t src_block_base,
+    std::uint32_t batch_size, std::uint32_t token_begin, std::uint32_t warp_idx,
+    std::uint32_t num_quant_warps) {
+    static constexpr std::uint32_t NumQuantBlocks =
+        Staged ? BlocksPerStage : (NumCols / QuantBlock);
+    static_assert(NumRows <= 16u, "MXFP8 quantize supports BS<=16");
+    static_assert(NumCols % QuantBlock == 0u,
+                  "the tile must span whole quantization blocks");
+    static_assert(NumQuantBlocks % BlocksPerStage == 0u,
+                  "the tile's blocks must fill whole staging slots");
+    static_assert(QuantBlock == 128u,
+                  "one 128-K block is four 32-K sub-blocks");
+    constexpr std::uint32_t kChunksPerBlock = QuantBlock / 16u;
+    constexpr std::uint32_t kSubBlocks = QuantBlock / 32u;
+    constexpr float kFp8Max = 448.f;
+    constexpr float kFp8MaxInv = 1.0f / 448.f;
+    const std::uint32_t lane = WarpRole::get_lane_idx();
+    const std::uint32_t col = lane * 4u;
+    const std::uint32_t sub = lane / 8u;
+    const bool leader = (lane % 8u) == 0u;
+
+#pragma unroll 1
+    for (std::uint32_t i = warp_idx; i < NumRows * NumQuantBlocks;
+         i += num_quant_warps) {
+        const std::uint32_t row = i / NumQuantBlocks;
+        const std::uint32_t token = token_begin + row;
+        const std::uint32_t blk = i % NumQuantBlocks;
+        const std::uint32_t slot = staging_slot_base + blk / BlocksPerStage;
+        const std::uint32_t chunk_at = (blk % BlocksPerStage) * kChunksPerBlock;
+        const std::uint32_t k = (src_block_base + blk) * QuantBlock + col;
+        const std::uint32_t src_row = token < batch_size ? row : 0u;
+        const DataType::ElementA* bf16_4;
+        if constexpr (Staged) {
+            const std::uint32_t rel = k - k_base;
+            const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;
+            bf16_4 = src + (rel / SwizzleBoxK) * (NumRows * SwizzleBoxK) +
+                     src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +
+                     rel % 8u;
+        } else {
+            bf16_4 = src + (token < batch_size ? token : 0u) * NumCols + k;
+        }
+
+        const std::uint32_t kc = chunk_at + col / 16u;
+        const std::uint32_t ki = col % 16u;
+        const std::uint32_t mx_block =
+            (src_block_base + blk) * kSubBlocks + sub;
+        std::uint8_t* const scale =
+            quantized_input_scale + mx_block * ScaleCols + token;
+        if (token >= batch_size) {
+            // One word per lane zeroes the padded row; the neutral exponent
+            // never contributes.
+            *reinterpret_cast<std::uint32_t*>(
+                &quantized_input[slot][kc][row][ki]) = 0u;
+            if (leader) *scale = 127u;
+            continue;
+        }
+
+        const float4 v = moe_load_quantize_pair(bf16_4);
+        float local_max =
+            fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+        local_max =
+            fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 1, 8));
+        local_max =
+            fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 2, 8));
+        local_max =
+            fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 4, 8));
+        const float blk_max = fmaxf(local_max, 1e-10f);
+        // UE8M0: round the exponent up, matching group_wise_quant's recipe.
+        const float biased_f = fminf(
+            fmaxf(ceilf(log2f(blk_max * kFp8MaxInv)) + 127.0f, 0.0f), 254.0f);
+        const float inv_scale = exp2f(127.0f - biased_f);
+
+        quantized_input[slot][kc][row][ki + 0] =
+            (DataType::ElementQA)(v.x * inv_scale);
+        quantized_input[slot][kc][row][ki + 1] =
+            (DataType::ElementQA)(v.y * inv_scale);
+        quantized_input[slot][kc][row][ki + 2] =
+            (DataType::ElementQA)(v.z * inv_scale);
+        quantized_input[slot][kc][row][ki + 3] =
+            (DataType::ElementQA)(v.w * inv_scale);
+        if (leader) {
+            *scale = static_cast<std::uint8_t>(biased_f);
+        }
+    }
+}
+
+// NumRows / NumCols are the tile's token rows and K extent; ScaleCols is the
+// scale table's token stride (the whole activation's token count).
+template <bool Staged, std::size_t NumRows, std::size_t NumCols,
+          std::size_t ScaleCols, std::size_t QuantBlock,
+          std::size_t SwizzleBoxK, std::size_t BlocksPerStage>
+__device__ inline void quantize_fp8_groupwise_128(
+    const DataType::ElementA* __restrict__ src, std::uint32_t k_base,
+    DataType::ElementQA (*__restrict__ quantized_input)[QuantBlock *
+                                                        BlocksPerStage / 16u]
+                                                       [NumRows + 1u][16u],
     float* __restrict__ quantized_input_scale, std::uint32_t staging_slot_base,
     std::uint32_t scale_block_base, std::uint32_t src_block_base,
     std::uint32_t batch_size, std::uint32_t token_begin, std::uint32_t warp_idx,
     std::uint32_t num_quant_warps) {
-    static_assert(kRingRows <= 16u,
-                  "quantize_fp8_blockwise_128 supports BS<=16");
+    static constexpr std::uint32_t NumQuantBlocks =
+        Staged ? BlocksPerStage : (NumCols / QuantBlock);
+    static_assert(NumRows <= 16u, "quantize_fp8_groupwise_128 supports BS<=16");
     static_assert(NumCols % QuantBlock == 0u,
                   "the tile must span whole quantization blocks");
-    static_assert(NumQuantBlocks % kBlocksPerSlot == 0u,
+    static_assert(NumQuantBlocks % BlocksPerStage == 0u,
                   "the tile's blocks must fill whole staging slots");
     constexpr std::uint32_t kChunksPerBlock = QuantBlock / 16u;
     const std::uint32_t col = WarpRole::get_lane_idx() * 4u;
 
 #pragma unroll 1
-    for (std::uint32_t i = warp_idx; i < kRingRows * NumQuantBlocks;
+    for (std::uint32_t i = warp_idx; i < NumRows * NumQuantBlocks;
          i += num_quant_warps) {
         // The window's row, and the launch-wide token it holds.
         const std::uint32_t row = i / NumQuantBlocks;
         const std::uint32_t token = token_begin + row;
         const std::uint32_t blk = i % NumQuantBlocks;
-        const std::uint32_t slot = staging_slot_base + blk / kBlocksPerSlot;
-        const std::uint32_t chunk_at = (blk % kBlocksPerSlot) * kChunksPerBlock;
+        const std::uint32_t slot = staging_slot_base + blk / BlocksPerStage;
+        const std::uint32_t chunk_at = (blk % BlocksPerStage) * kChunksPerBlock;
         const std::uint32_t sblk = scale_block_base + blk;
         const std::uint32_t k = (src_block_base + blk) * QuantBlock + col;
         // A padded token re-reads the ring's first row: the store zeroes it
@@ -185,7 +285,7 @@ __device__ inline void quantize_fp8_blockwise_128(
             // The box's 16-B chunk index is XOR-ed with the row.
             const std::uint32_t rel = k - k_base;
             const std::uint32_t chunk = (rel % SwizzleBoxK) / 8u;
-            bf16_4 = src + (rel / SwizzleBoxK) * (kRingRows * SwizzleBoxK) +
+            bf16_4 = src + (rel / SwizzleBoxK) * (NumRows * SwizzleBoxK) +
                      src_row * SwizzleBoxK + (chunk ^ (src_row % 8u)) * 8u +
                      rel % 8u;
         } else {
@@ -193,10 +293,9 @@ __device__ inline void quantize_fp8_blockwise_128(
             // launch-wide token.
             bf16_4 = src + (token < batch_size ? token : 0u) * NumCols + k;
         }
-        moe_streaming_quantize_k128<kRingRows,
-                                    QuantBlock / 16u * kBlocksPerSlot>(
+        moe_streaming_quantize_k128<NumRows, QuantBlock / 16u * BlocksPerStage>(
             bf16_4, row, chunk_at, token, batch_size, quantized_input[slot],
-            &quantized_input_scale[sblk * kScaleCols + token]);
+            &quantized_input_scale[sblk * ScaleCols + token]);
     }
 }
 

@@ -19,6 +19,8 @@
 #include <cuda_fp8.h>
 
 #include <cstdint>
+#include <cute/tensor.hpp>
+#include <type_traits>
 
 namespace halops::moe {
 
@@ -28,7 +30,17 @@ enum class MmaKind : uint32_t {
     kHmma = 1,  // warp-level mma.sync on the calc warps
 };
 
-template <bool UseLatent = true>
+// Weight quantization recipe of one group.  The activation side follows the
+// weight side: block-wise weights use 128-K-block activations, MX weights use
+// 1x32 MX activations.
+enum class QuantMode : std::uint32_t {
+    kBlockwiseFP8 = 0,  // BxB blocks, fp32 scales
+    kMXFP8 = 1,         // 1x32 blocks, UE8M0 scales
+    kMXFP4 = 2,         // 1x32 blocks, packed FP4 weights, UE8M0 scales
+};
+
+template <bool UseLatent = true,
+          QuantMode LatentQuant = QuantMode::kBlockwiseFP8>
 struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr uint32_t kHiddenSize = 4096;
     static constexpr uint32_t kIntermediateSize = 512;
@@ -39,6 +51,7 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr uint32_t kQuantBlockM = 128;
     static constexpr uint32_t kQuantBlockK = 128;
     static constexpr bool kUseLatent = UseLatent;
+    static constexpr QuantMode kLatentQuant = LatentQuant;
     static constexpr std::uint32_t kNumRouterGates = 2;
     struct KernelConfig {
         static constexpr std::uint32_t kBlockSize = 384;
@@ -69,9 +82,10 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     };
 };
 
-template <bool UseLatent = true>
+template <bool UseLatent = true,
+          QuantMode LatentQuant = QuantMode::kBlockwiseFP8>
 struct Dims_BS16_E512_N512_K2048_SM100
-    : Dims_BS8_E512_N512_K2048_SM100<UseLatent> {
+    : Dims_BS8_E512_N512_K2048_SM100<UseLatent, LatentQuant> {
     static constexpr uint32_t kNumTokens = 16;
     struct KernelConfig
         : Dims_BS8_E512_N512_K2048_SM100<UseLatent>::KernelConfig {

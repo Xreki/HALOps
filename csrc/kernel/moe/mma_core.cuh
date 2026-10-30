@@ -41,6 +41,11 @@ struct SwizzleBoxK {
     static constexpr std::uint32_t value = 1024u / cute::sizeof_bits_v<T>;
 };
 
+// UE8M0: the byte is a biased power-of-two exponent.
+__device__ __forceinline__ float ue8m0_to_float(std::uint8_t biased_exp) {
+    return exp2f(static_cast<float>(biased_exp) - 127.0f);
+}
+
 // The SM100 UMMA instruction for an operand pair.
 template <class ElementA, class ElementB, class ElementAcc, class AtomShape,
           cute::UMMA::Major MajorA = cute::UMMA::Major::K,
@@ -436,6 +441,62 @@ struct HmmaCore<__nv_fp8_e4m3, ElementAcc, TileShape, StagedRows> {
                 acc[m][1] += cur[1] * ws * as1;
                 acc[m][2] += cur[2] * ws * as0;
                 acc[m][3] += cur[3] * ws * as1;
+            }
+        }
+    }
+
+    // MXFP8: one UE8M0 scale per 32-K atom and weight row, applied after each
+    // instruction.  `w_scale` is [row][global 32-K block], `act_scale` is
+    // [global 32-K block][ScaleRows], and `atom_base` is this tile's first
+    // global 32-K block.
+    template <std::uint32_t ScaleRows = kTileShapeN>
+    __device__ static void run_mx(Element const* __restrict__ a,
+                                  Element const* __restrict__ b,
+                                  float (&acc)[kNumAtomMs][kAtomElemsC],
+                                  std::uint8_t const* __restrict__ w_scale,
+                                  std::uint32_t w_scale_stride,
+                                  std::uint8_t const* __restrict__ act_scale,
+                                  std::uint32_t atom_base) {
+        const std::uint32_t lane_idx = threadIdx.x % 32u;
+        const std::uint32_t local = lane_idx / 4u;
+        const std::uint32_t col = 2u * (lane_idx & 3u);
+        const std::uint32_t inner4 = lane_idx & 3u;
+#pragma unroll
+        for (std::uint32_t block = 0; block < kQuantBlocksPerTile; ++block) {
+            Element const* const a_block = a + block * kWeightBlockElems;
+            Element const* const b_block = b + block * kStagedBlockElems;
+#pragma unroll
+            for (std::uint32_t k = 0; k < kAtomsPerQuantBlock; ++k) {
+                const std::uint32_t atom =
+                    atom_base + block * kAtomsPerQuantBlock + k;
+                const float as0 =
+                    ue8m0_to_float(act_scale[atom * ScaleRows + col]);
+                const float as1 =
+                    ue8m0_to_float(act_scale[atom * ScaleRows + col + 1u]);
+#pragma unroll
+                for (std::uint32_t m = 0; m < kNumAtomMs; ++m) {
+                    const std::uint32_t row0 = m * kAtomShapeM + local;
+                    const std::uint32_t row1 = row0 + kAtomShapeM / 2u;
+                    const float ws0 =
+                        ue8m0_to_float(w_scale[row0 * w_scale_stride + atom]);
+                    const float ws1 =
+                        ue8m0_to_float(w_scale[row1 * w_scale_stride + atom]);
+                    float cur[kAtomElemsC] = {};
+                    std::uint32_t a_reg[kAtomOperandsA];
+                    a_reg[0] = *weight_word(a_block, row0, 2u * k, inner4);
+                    a_reg[1] = *weight_word(a_block, row1, 2u * k, inner4);
+                    a_reg[2] = *weight_word(a_block, row0, 2u * k + 1u, inner4);
+                    a_reg[3] = *weight_word(a_block, row1, 2u * k + 1u, inner4);
+                    std::uint32_t b_reg[kAtomOperandsB];
+                    b_reg[0] = *staged_word(b_block, 2u * k, local, inner4);
+                    b_reg[1] =
+                        *staged_word(b_block, 2u * k + 1u, local, inner4);
+                    fp8_mma_16x8x32(cur, a_reg, b_reg);
+                    acc[m][0] += cur[0] * ws0 * as0;
+                    acc[m][1] += cur[1] * ws0 * as1;
+                    acc[m][2] += cur[2] * ws1 * as0;
+                    acc[m][3] += cur[3] * ws1 * as1;
+                }
             }
         }
     }

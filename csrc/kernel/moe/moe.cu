@@ -19,8 +19,10 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 #include "moe_kernel.cuh"
+#include "moe_quant.h"
 
 #ifndef CHECK_CUDA
 #    define CHECK_CUDA(call)                                           \
@@ -79,19 +81,28 @@ void CheckRouterShape(const torch::Tensor& router_weight) {
 template <typename MoEDims>
 void CheckLatentDownShape(const torch::Tensor& latent_down_weight,
                           const torch::Tensor& latent_down_weight_scale) {
-    constexpr std::int64_t kBlockM = MoEDims::kQuantBlockM;
-    constexpr std::int64_t kBlockK = MoEDims::kQuantBlockK;
+    using Quant = moe::QuantTraits<MoEDims::kLatentQuant>;
+    constexpr bool kUint8Scale =
+        std::is_same_v<typename Quant::ScaleType, std::uint8_t>;
+    constexpr auto kScaleShape =
+        Quant::template ScaleShape<MoEDims::kLatentSize,
+                                   MoEDims::kHiddenSize>();
+    constexpr std::int64_t kScaleRows =
+        static_cast<std::int64_t>(cute::get<0>(kScaleShape));
+    constexpr std::int64_t kScaleCols =
+        static_cast<std::int64_t>(cute::get<1>(kScaleShape));
     TORCH_CHECK(latent_down_weight.dim() == 2 &&
                     latent_down_weight.size(0) == MoEDims::kLatentSize &&
                     latent_down_weight.size(1) == MoEDims::kHiddenSize,
                 "moe: latent_down_weight must be [kLatentSize, kHiddenSize].");
-    TORCH_CHECK(
-        latent_down_weight_scale.dim() == 2 &&
-            latent_down_weight_scale.size(0) ==
-                MoEDims::kLatentSize / kBlockM &&
-            latent_down_weight_scale.size(1) == MoEDims::kHiddenSize / kBlockK,
-        "moe: latent_down_weight_scale must be [L/", kBlockM, ", H/", kBlockK,
-        "].");
+    TORCH_CHECK(latent_down_weight_scale.dim() == 2 &&
+                    latent_down_weight_scale.size(0) == kScaleRows &&
+                    latent_down_weight_scale.size(1) == kScaleCols,
+                "moe: latent_down_weight_scale must be [", kScaleRows, ", ",
+                kScaleCols, "].");
+    TORCH_CHECK(latent_down_weight_scale.scalar_type() ==
+                    (kUint8Scale ? at::kByte : at::kFloat),
+                "moe: latent_down_weight_scale has the wrong dtype.");
 }
 
 template <typename MoEDims>
@@ -318,8 +329,10 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                                   ? static_cast<const DataType::ElementW*>(
                                         latent_down_weight.const_data_ptr())
                                   : nullptr;
+    using LatentScale =
+        typename moe::LatentDownGemmTraits<MoEDims>::ScaleElement;
     args.latent_down_weight_scale =
-        MoEDims::kUseLatent ? static_cast<const DataType::ElementScale*>(
+        MoEDims::kUseLatent ? static_cast<const LatentScale*>(
                                   latent_down_weight_scale.const_data_ptr())
                             : nullptr;
 
@@ -377,7 +390,17 @@ void MoE(const torch::Tensor& input, const torch::Tensor& router_weight,
          const torch::Tensor& shared_out, int64_t top_k,
          int64_t num_router_gates, const std::string& scoring_func,
          bool renormalize, const std::string& activation, double situ_beta,
-         double situ_linear_beta) {
+         double situ_linear_beta, const std::string& quant_mode) {
+    moe::MoERecipe recipe{};
+    std::string recipe_error;
+    TORCH_CHECK(moe::ParseRecipe(quant_mode, recipe, recipe_error),
+                "moe: invalid quant_mode (", recipe_error, "); expected ",
+                moe::SupportedRecipesToString(), ".");
+    TORCH_CHECK(moe::IsSupportedRecipe(recipe), "moe: quant_mode ",
+                moe::RecipeToString(recipe), " is not implemented; supported: ",
+                moe::SupportedRecipesToString(), ".");
+    const bool latent_mxfp8 = recipe == moe::kLatentMXFP8Recipe;
+
     MOE_CHECK_TENSOR_TYPE(input, at::kBFloat16);
     MOE_CHECK_TENSOR_TYPE(router_weight, at::kBFloat16);
     MOE_CHECK_TENSOR_TYPE(expert_up_weights, at::kFloat8_e4m3fn);
@@ -402,7 +425,8 @@ void MoE(const torch::Tensor& input, const torch::Tensor& router_weight,
         latent_down_weight_scale.has_value()) {
         use_latent = true;
         MOE_CHECK_TENSOR_TYPE(*latent_down_weight, at::kFloat8_e4m3fn);
-        MOE_CHECK_TENSOR_TYPE(*latent_down_weight_scale, at::kFloat);
+        MOE_CHECK_TENSOR_TYPE(*latent_down_weight_scale,
+                              latent_mxfp8 ? at::kByte : at::kFloat);
     }
 
     TORCH_CHECK(input.dim() == 2, "moe: input must be [tokens, hidden].");
@@ -448,9 +472,20 @@ void MoE(const torch::Tensor& input, const torch::Tensor& router_weight,
                 "moe: this build runs the latent stage; pass "
                 "latent_down_weight and latent_down_weight_scale.");
     if (num_tokens <= 8) {
-        launch_func(moe::Dims_BS8_E512_N512_K2048_SM100<true>{});
+        if (latent_mxfp8) {
+            launch_func(
+                moe::Dims_BS8_E512_N512_K2048_SM100<true,
+                                                    moe::QuantMode::kMXFP8>{});
+        } else {
+            launch_func(moe::Dims_BS8_E512_N512_K2048_SM100<
+                        true, moe::QuantMode::kBlockwiseFP8>{});
+        }
     } else {
-        launch_func(moe::Dims_BS16_E512_N512_K2048_SM100<true>{});
+        TORCH_CHECK(!latent_mxfp8,
+                    "moe: mxfp8 latent weights need num_tokens <= 8 in this "
+                    "build.");
+        launch_func(moe::Dims_BS16_E512_N512_K2048_SM100<
+                    true, moe::QuantMode::kBlockwiseFP8>{});
     }
 }
 
