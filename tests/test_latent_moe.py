@@ -20,9 +20,10 @@ import torch.nn.functional as F
 
 from halops import (
     get_workspace_for_moe,
-    latent_moe,
+    low_latency_moe,
     transform_weights_for_moe,
 )
+from halops.moe.low_latency_moe import _quantize_latent
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
 
@@ -60,7 +61,7 @@ def _quant_fp8_per_token(x, block_size=128):
 
 
 class MoEParams:
-    """One `latent_moe` call: the knobs, plus the operands `init_weights` fills."""
+    """One `low_latency_moe` call: the knobs, plus the operands `init_weights` fills."""
 
     def __init__(self, use_latent=True, activation="silu"):
         self.hidden_size = 4096
@@ -94,12 +95,12 @@ class MoEParams:
         w2, s2 = _quant_fp8_block_wise(
             torch.randn(e, z, n, device=dev, generator=g) * 0.1
         )
-        latent_w = latent_s = None
+        latent_w = latent_s = latent_w_bf16 = None
         if self.use_latent:
             # The kernel reads [L, H], so the scales are transposed.
-            lw, ls = _quant_fp8_block_wise(
-                torch.randn(1, h, z, device=dev, generator=g) * 0.1
-            )
+            raw = torch.randn(1, h, z, device=dev, generator=g) * 0.1
+            lw, ls = _quant_fp8_block_wise(raw)
+            latent_w_bf16 = raw[0].bfloat16()
             latent_w = lw[0]
             latent_s = ls[0].t().contiguous()
 
@@ -110,6 +111,7 @@ class MoEParams:
         self.expert_down_weights_scale = s2
         self.latent_down_weight = latent_w
         self.latent_down_weight_scale = latent_s
+        self.latent_down_weight_bf16 = latent_w_bf16
 
         shared_up, shared_up_s = _quant_fp8_block_wise(
             torch.randn(1, 2 * n, h, device=dev, generator=g) * 0.1
@@ -180,6 +182,28 @@ def _block_wise_gemm(
                 partial = subblock if partial is None else partial + subblock
             result[r0:r1] += partial * scales_bw[ri, ci]
     return result
+
+
+def _quant_mxfp8_activation(x):
+    """The kernel's per-token, per-32-K UE8M0 activation quantizer."""
+    xf = x.float()
+    rows, cols = xf.shape
+    blocks = xf.reshape(rows, cols // 32, 32)
+    amax = blocks.abs().amax(-1).clamp(min=1e-10)
+    biased = torch.ceil(torch.log2(amax * (1.0 / 448.0))) + 127.0
+    scale = torch.exp2(biased.clamp(0.0, 254.0) - 127.0)
+    return (blocks / scale[..., None]).clamp(-448.0, 448.0).reshape(rows, cols), scale
+
+
+def _sf_to_plain(scale_sf, rows, cols):
+    """Decode a CUTLASS SfAtom blob [rows, cols] (uint8) to float scales."""
+    n_tiles, k_tiles = rows // 128, cols // 4
+    blob = scale_sf.reshape(n_tiles, k_tiles, 512).to(torch.int64)
+    r = torch.arange(128, device=scale_sf.device)
+    s = torch.arange(4, device=scale_sf.device)
+    idx = (r[:, None] % 32) * 16 + (r[:, None] // 32) * 4 + s[None, :]
+    vals = blob[:, :, idx].permute(0, 2, 1, 3).reshape(rows, cols)
+    return torch.exp2(vals.float() - 127.0)
 
 
 def _routing_sigmoid_topk_from_scores(scores, top_k):
@@ -315,6 +339,38 @@ class MoERef:
         return routed_out, shared_out
 
 
+class MoERefMxLatent(MoERef):
+    """``MoERef`` with the latent down-projection quantized as MXFP8."""
+
+    def __call__(self, input, top_k, latent_w_mx, latent_scale_sf):
+        shared_out = self._shared_expert(input)
+
+        scores = _router_scores(self._router_logits(input))
+        topk_w, topk_ids = _routing_sigmoid_topk_from_scores(scores, top_k)
+
+        p = self.moe_params
+        xq, x_scale = _quant_mxfp8_activation(input)
+        w_scale = _sf_to_plain(latent_scale_sf, p.latent_size, p.hidden_size // 32)
+        xf = (xq.reshape(xq.shape[0], -1, 32) * x_scale[..., None]).reshape(xq.shape)
+        wf = (
+            latent_w_mx.float().reshape(p.latent_size, -1, 32) * w_scale[..., None]
+        ).reshape(p.latent_size, p.hidden_size)
+        latent_out = (xf.bfloat16() @ wf.bfloat16().T).bfloat16()
+
+        routed_out = self.routed_experts(
+            latent_out,
+            p.expert_up_weights,
+            p.expert_up_weights_scale,
+            p.expert_down_weights,
+            p.expert_down_weights_scale,
+            topk_w,
+            topk_ids,
+            p.intermediate_size,
+            latent_out.shape[1],
+        )
+        return routed_out, shared_out
+
+
 class MoEFused:
     """The prebuilt op behind one object: the weights are packed once."""
 
@@ -350,7 +406,7 @@ class MoEFused:
             dtype=torch.bfloat16,
             device=input.device,
         )
-        latent_moe(
+        low_latency_moe(
             input,
             self.packed_weights["router_weight"],
             self.packed_weights["expert_up_weights"],
@@ -436,6 +492,72 @@ def test_moe_accuracy(num_tokens, top_k, activation):
     )
     assert cos_routed > 0.98, f"cosine similarity too low: {cos_routed:.5f}"
     assert cos_shared > 0.98, f"cosine similarity too low: {cos_shared:.5f}"
+
+
+def test_moe_latent_mxfp8_accuracy():
+    top_k, num_tokens = 8, 8
+    dev = torch.device("cuda")
+    moe_params = MoEParams(use_latent=True)
+    moe_params.init_weights()
+    input = torch.randn(
+        num_tokens, moe_params.hidden_size, device=dev, dtype=torch.bfloat16
+    )
+
+    packed = transform_weights_for_moe(
+        moe_params.router_weight,
+        moe_params.expert_up_weights,
+        moe_params.shared_up_weight,
+        moe_params.latent_down_weight,
+        num_tokens,
+        moe_params.num_router_gates,
+    )
+    latent_w_mx, latent_s_mx = _quantize_latent(
+        moe_params.latent_down_weight_bf16, "w8a8-mxfp8"
+    )
+
+    workspace = get_workspace_for_moe(input)
+    routed_out = torch.zeros(
+        num_tokens, moe_params.latent_size, dtype=torch.bfloat16, device=dev
+    )
+    shared_out = torch.zeros(
+        num_tokens, moe_params.hidden_size, dtype=torch.bfloat16, device=dev
+    )
+    low_latency_moe(
+        input,
+        packed["router_weight"],
+        packed["expert_up_weights"],
+        moe_params.expert_up_weights_scale,
+        moe_params.expert_down_weights,
+        moe_params.expert_down_weights_scale,
+        packed["shared_up_weight"],
+        moe_params.shared_up_weight_scale,
+        moe_params.shared_down_weight,
+        moe_params.shared_down_weight_scale,
+        latent_w_mx,
+        latent_s_mx,
+        workspace,
+        routed_out,
+        shared_out,
+        top_k,
+        moe_params.num_router_gates,
+        moe_params.scoring_func,
+        moe_params.renormalize,
+        moe_params.activation,
+        moe_params.situ_beta,
+        moe_params.situ_linear_beta,
+        {"latent_down": "w8a8-mxfp8", "default": "w8a8-blockwise"},
+    )
+
+    ref = MoERefMxLatent(moe_params)
+    routed_ref, shared_ref = ref(input, top_k, latent_w_mx, latent_s_mx)
+    cos = _cosine(routed_out, routed_ref)
+    cos_shared = _cosine(shared_out, shared_ref)
+    print(
+        f"\n[moe mxfp8 latent] m={num_tokens} top_k={top_k}: "
+        f"cos={cos:.5f}, {cos_shared:.5f}"
+    )
+    assert cos > 0.98, f"routed cos too low: {cos:.5f}"
+    assert cos_shared > 0.98, f"shared cos too low: {cos_shared:.5f}"
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])

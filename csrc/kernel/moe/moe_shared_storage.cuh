@@ -22,10 +22,9 @@
 #include <cute/arch/copy_sm90_desc.hpp>
 #include <cute/tensor.hpp>
 
-#include "moe_configs.cuh"
-#include "moe_interface.h"
-#include "moe_traits.cuh"
-#include "ptx_utils.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/ptx_utils.cuh"
 
 namespace halops::moe {
 
@@ -138,18 +137,17 @@ struct TransactionBarrier : BarrierRingBase<N> {
 template <typename Dims>
 struct MoEBarriers {
     static constexpr std::uint32_t kNumUpWeightSlots =
-        NumUpWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumUpWeightSlots;
     static constexpr std::uint32_t kNumDownWeightSlots =
-        NumDownWeightSlots<Dims>::value;
+        Dims::KernelConfig::kNumDownWeightSlots;
     static constexpr std::uint32_t kNumScaleSlots = 2;
     static constexpr std::uint32_t kNumActivationSlots = kNumDownWeightSlots;
     static constexpr std::uint32_t kNumAccumulatorSlots =
-        NumAccSlots<Dims>::value;
+        Dims::KernelConfig::kNumAccSlots;
     static constexpr std::uint32_t kNumRouterWeightSlots =
         RouterGemmTraits<Dims>::kNumWeightSlots;
 
     // LatentDown
-    static constexpr std::uint32_t kNumInputSlots = NumInputSlots<Dims>::value;
     static constexpr std::uint32_t kNumLatentWeightSlots =
         LatentDownGemmTraits<Dims>::kNumWeightSlots;
     TransactionBarrier<MoEKernelTraits<Dims>::kLatentInputSlots>
@@ -351,6 +349,7 @@ struct RoutingSmem {
 };
 
 // A ring of streamed bf16 activation tiles: B operand and quantize source.
+// A ring of streamed bf16 activation tiles: B operand and quantize source.
 template <std::uint32_t NumSlots, std::uint32_t TileShapeN,
           std::uint32_t TileShapeK>
 struct ActivationSmem {
@@ -371,22 +370,26 @@ struct ActivationSmem {
 // The quantize's fp8 output, which is also the MMA's B operand.
 template <std::uint32_t NumSlots, std::uint32_t TileShapeN,
           std::uint32_t TileShapeK, std::uint32_t GemmN, std::uint32_t GemmK,
-          std::uint32_t QuantBlockK>
+          std::uint32_t QuantBlock, QuantMode Mode = QuantMode::kBlockwiseFP8>
 struct QuantizedActivationSmem {
     using Element = DataType::ElementQA;
-    using ElementScale = DataType::ElementScale;
+    using Quant = QuantTraits<Mode, QuantBlock>;
+    using ElementScale = typename Quant::ScaleType;
 
     static constexpr std::uint32_t kNumSlots = NumSlots;
     static constexpr std::uint32_t kLboChunkK = kFp8ActChunkK;
     static constexpr std::uint32_t kNumLboChunksK = TileShapeK / kLboChunkK;
-    static constexpr std::uint32_t kNumQuantBlocks = GemmK / QuantBlockK;
+    // The activation scale group width: the caller's group for group-wise
+    // recipes (128, or 64 for the shared expert's up output); fixed for MX.
+    static constexpr std::uint32_t kScaleGroupK = Quant::BlockSize;
+    static constexpr std::uint32_t kScaleGroups = GemmK / kScaleGroupK;
 
     static_assert(TileShapeK % kLboChunkK == 0u,
                   "a tile must be whole 16-B chunks");
 
     alignas(1024)
         Element data[kNumSlots][kNumLboChunksK][TileShapeN + 1u][kLboChunkK];
-    ElementScale scale[kNumQuantBlocks][GemmN];
+    ElementScale scale[kScaleGroups][GemmN];
 };
 
 template <typename Dims>
@@ -425,10 +428,10 @@ struct LatentDownSmem {
                    LatentDownGemm::kTileShapeK>
         input;
 
-    QuantizedActivationSmem<Traits::kLatentInputSlots,
-                            LatentDownGemm::kTileShapeN,
-                            LatentDownGemm::kTileShapeK, LatentDownGemm::kGemmN,
-                            LatentDownGemm::kGemmK, Dims::kQuantBlockK>
+    QuantizedActivationSmem<
+        Traits::kLatentInputSlots, LatentDownGemm::kTileShapeN,
+        LatentDownGemm::kTileShapeK, LatentDownGemm::kGemmN,
+        LatentDownGemm::kGemmK, Dims::kQuantBlockK, Dims::kLatentQuant>
         quantized_input;
 
     static constexpr std::uint32_t kNumMmaWarps =
@@ -441,8 +444,20 @@ struct LatentDownSmem {
                LatentDownGemm::kTileShapeN>::value;
     alignas(16) float mma_out[kNumMmaWarps][kMmaRows][kMmaCols];
 
-    DataType::ElementScale
-        w_latent_down_scale[LatentDownGemm::kNumScaleBlocksK];
+    // The latent weight scales in the built recipe's layout, sized by
+    // QuantTraits: one fp32 per 128-K block, or one UE8M0 byte per row and
+    // 32-K block.
+    using Quant = typename LatentDownGemm::Quant;
+    using WeightScale = typename Quant::ScaleType;
+    static constexpr auto kWeightScaleShape =
+        Quant::template ScaleShape<LatentDownGemm::kTileShapeM,
+                                   LatentDownGemm::kGemmK>();
+    static constexpr std::uint32_t kWeightScaleRows =
+        static_cast<std::uint32_t>(cute::get<0>(kWeightScaleShape));
+    static constexpr std::uint32_t kWeightScaleCols =
+        static_cast<std::uint32_t>(cute::get<1>(kWeightScaleShape));
+    alignas(16)
+        WeightScale w_latent_down_scale[kWeightScaleRows][kWeightScaleCols];
 
     static constexpr std::uint32_t kNumOutChunks =
         Select<Traits::kLatentQuantizeOutput,

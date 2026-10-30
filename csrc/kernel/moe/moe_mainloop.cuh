@@ -19,19 +19,19 @@
 
 #include <cute/arch/copy_sm90_desc.hpp>
 
-#include "moe_handoff.cuh"
-#include "moe_input.cuh"
-#include "moe_interface.h"
-#include "moe_mainloop_down.cuh"
-#include "moe_mainloop_latent.cuh"
-#include "moe_mainloop_router.cuh"
-#include "moe_mainloop_shared.cuh"
-#include "moe_mainloop_up.cuh"
-#include "moe_scheduler.cuh"
-#include "moe_shared_storage.cuh"
-#include "moe_tma.h"
-#include "moe_traits.cuh"
-#include "moe_workspace.cuh"
+#include "kernel/moe/moe_configs.cuh"
+#include "kernel/moe/moe_cta_comm.cuh"
+#include "kernel/moe/moe_input.cuh"
+#include "kernel/moe/moe_mainloop_down.cuh"
+#include "kernel/moe/moe_mainloop_latent.cuh"
+#include "kernel/moe/moe_mainloop_router.cuh"
+#include "kernel/moe/moe_mainloop_shared.cuh"
+#include "kernel/moe/moe_mainloop_up.cuh"
+#include "kernel/moe/moe_scheduler.cuh"
+#include "kernel/moe/moe_shared_storage.cuh"
+#include "kernel/moe/moe_tma.cuh"
+#include "kernel/moe/moe_traits.cuh"
+#include "kernel/moe/moe_workspace.cuh"
 
 namespace halops::moe {
 
@@ -66,7 +66,8 @@ struct CollectiveMainloopMoE {
         const DataType::ElementW* shared_down_weight;
         const DataType::ElementScale* shared_down_weight_scale;
         const typename Traits::LatentDownGemm::MmaElement* latent_down_weight;
-        const DataType::ElementScale* latent_down_weight_scale;
+        const typename Traits::LatentDownGemm::ScaleElement*
+            latent_down_weight_scale;
         DataType::ElementOut* routed_out;
         DataType::ElementOut* shared_out;
         void* workspace;
@@ -92,7 +93,8 @@ struct CollectiveMainloopMoE {
         DataType::ElementOut* __restrict__ activations_out;
         const typename Traits::LatentDownGemm::
             MmaElement* __restrict__ latent_down_weight;
-        const DataType::ElementScale* __restrict__ latent_down_weight_scale;
+        const typename Traits::LatentDownGemm::
+            ScaleElement* __restrict__ latent_down_weight_scale;
         const DataType::ElementW* __restrict__ shared_up_weight;
         const DataType::ElementScale* __restrict__ shared_up_scale;
         const DataType::ElementW* __restrict__ shared_down_weight;
@@ -163,7 +165,7 @@ struct CollectiveMainloopMoE {
                       Traits::kExpertWeightBytes)
                 : 0xFFFFFFFFu;
 
-        params.tma_up_weights_desc = create_up_weight_tma_desc(
+        params.tma_up_weights_desc = CreateUpWeightTmaDesc(
             reinterpret_cast<const void*>(args.expert_up_weights),
             Dims::kNumExperts, Dims::kIntermediateSize,
             MoEInputSize<Dims>::value);
@@ -171,11 +173,11 @@ struct CollectiveMainloopMoE {
         // against globalDim and zero-fills out-of-bounds box rows.
         // The box is one 8-row swizzle atom; a ring taller than that issues
         // one box per atom.
-        params.tma_input_desc = create_activations_tma_desc(
+        params.tma_input_desc = CreateActivationsTmaDesc(
             reinterpret_cast<const void*>(args.input), args.num_tokens,
             /*block_rows=*/8u, Dims::kHiddenSize);
         if constexpr (Traits::kUseLatent && !Traits::kLatentQuantizeOutput) {
-            params.tma_latent_out_desc = create_activations_tma_desc(
+            params.tma_latent_out_desc = CreateActivationsTmaDesc(
                 reinterpret_cast<const void*>(
                     reinterpret_cast<Workspace*>(args.workspace)
                         ->latent_down_out.data_ptr()),
@@ -183,25 +185,25 @@ struct CollectiveMainloopMoE {
         }
         // row_box pinned to 128: the down tile's M can exceed the
         // 256-row boxDim cap.
-        params.tma_down_weights_desc = create_down_weight_tma_desc(
+        params.tma_down_weights_desc = CreateDownWeightTmaDesc(
             reinterpret_cast<const void*>(args.expert_down_weights),
             Dims::kNumExperts, MoEInputSize<Dims>::value,
             Dims::kIntermediateSize,
             /*row_box=*/128u);
         // The down activations live inside the scratchpad at
         // kUpOutFp8Offset.
-        params.tma_down_activations_desc = create_down_activation_tma_desc(
+        params.tma_down_activations_desc = CreateDownActivationTmaDesc(
             reinterpret_cast<const char*>(args.workspace) +
                 Workspace::kUpOutFp8Offset,
             Workspace::kMaxRoutedRows, Dims::kNumTokens,
             Dims::kIntermediateSize);
         if constexpr (Traits::kUseSharedExpert) {
             if (args.shared_out != nullptr) {
-                params.tma_shared_up_desc = create_up_weight_tma_desc(
+                params.tma_shared_up_desc = CreateUpWeightTmaDesc(
                     reinterpret_cast<const void*>(args.shared_up_weight),
                     /*num_experts=*/1u, Dims::kIntermediateSize,
                     Dims::kHiddenSize, SharedUpGemmTraits<Dims>::kTileShapeM);
-                params.tma_shared_down_desc = create_down_weight_tma_desc(
+                params.tma_shared_down_desc = CreateDownWeightTmaDesc(
                     reinterpret_cast<const void*>(args.shared_down_weight),
                     /*num_experts=*/1u, Dims::kHiddenSize,
                     Dims::kIntermediateSize,
@@ -209,11 +211,10 @@ struct CollectiveMainloopMoE {
             }
         }
         if (args.latent_down_weight != nullptr) {
-            params.tma_latent_down_weight_desc =
-                create_latent_down_weight_tma_desc(
-                    reinterpret_cast<const void*>(args.latent_down_weight),
-                    Dims::kLatentSize, Dims::kHiddenSize,
-                    Traits::LatentDownGemm::kTileShapeM);
+            params.tma_latent_down_weight_desc = CreateLatentDownWeightTmaDesc(
+                reinterpret_cast<const void*>(args.latent_down_weight),
+                Dims::kLatentSize, Dims::kHiddenSize,
+                Traits::LatentDownGemm::kTileShapeM);
         }
         return params;
     }
@@ -260,8 +261,8 @@ struct CollectiveMainloopMoE {
                                params.token_count > WarpRole::kCalcWarpCount;
         if (threadIdx.x == 0u) {
             // One task per router CTA, whatever its M tile or K slice.
-            workspace->handoff.wait_router_tasks(smem->launch_parity,
-                                                 Traits::RouterGemm::kNumCtas);
+            workspace->cta_comm.wait_router_tasks(smem->launch_parity,
+                                                  Traits::RouterGemm::kNumCtas);
         }
         WarpRole::sync_calc_threads();
         const std::uint32_t calc_warp_idx = WarpRole::get_calc_warp_idx();
@@ -374,7 +375,7 @@ struct CollectiveMainloopMoE {
             // After the projection: one warp copies block 0's tables, and it
             // does not contend with the projection's own warps.
             if (lane_idx == 0u) {
-                workspace->handoff.wait_router_tables(smem->launch_parity);
+                workspace->cta_comm.wait_router_tables(smem->launch_parity);
             }
             __syncwarp();
             load_routing_tables(workspace, smem, lane_idx);
@@ -396,7 +397,7 @@ struct CollectiveMainloopMoE {
         __threadfence();
         __syncwarp();
         if (lane_idx == 0u) {
-            workspace->handoff.publish_router_tables(smem->launch_parity);
+            workspace->cta_comm.publish_router_tables(smem->launch_parity);
         }
     }
 
@@ -453,11 +454,10 @@ struct CollectiveMainloopMoE {
     // input ring holds the projection output outright.
     __device__ void quantize_up_input_whole(SharedStorage* __restrict__ smem,
                                             int batch_size) {
-        quantize_fp8_blockwise_128<
-            /*kStaged=*/false, Dims::kNumTokens, Traits::UpGemm::kGemmN,
-            Dims::kLatentSize, /*SwizzleBoxK=*/1u, Dims::kQuantBlockK,
-            Dims::kLatentSize / Dims::kQuantBlockK,
-            /*kBlocksPerSlot=*/Traits::kQuantBlocksPerTile>(
+        quantize_fp8_groupwise_128<
+            /*Staged=*/false, Dims::kNumTokens, Dims::kLatentSize,
+            Traits::UpGemm::kGemmN, Dims::kQuantBlockK, /*SwizzleBoxK=*/1u,
+            /*BlocksPerStage=*/Traits::kQuantBlocksPerTile>(
             reinterpret_cast<const DataType::ElementA*>(
                 &smem->routed_experts.input.data[0][0][0]),
             /*k_base=*/0u, &smem->routed_experts.quantized_input.data[0],
@@ -491,11 +491,10 @@ struct CollectiveMainloopMoE {
         for (std::uint32_t tile = 0; tile < num_tiles; ++tile) {
             const std::uint32_t slot = tile % Traits::kUpInputSlots;
             smem->barriers.up_input_slot_ready.wait(tile);
-            quantize_fp8_blockwise_128<
-                /*kStaged=*/true, Dims::kNumTokens, Traits::UpGemm::kGemmN,
-                kInputTileK, SwizzleBoxK<DataType::ElementA>::value,
-                Dims::kQuantBlockK, kBlocksPerTile,
-                /*kBlocksPerSlot=*/kBlocksPerTile>(
+            quantize_fp8_groupwise_128<
+                /*Staged=*/true, Dims::kNumTokens, kInputTileK,
+                Traits::UpGemm::kGemmN, Dims::kQuantBlockK,
+                SwizzleBoxK<DataType::ElementA>::value, kBlocksPerTile>(
                 &smem->routed_experts.input.data[slot][0][0][0],
                 tile * kInputTileK,
                 &smem->routed_experts.quantized_input.data[0],
@@ -558,7 +557,7 @@ struct CollectiveMainloopMoE {
             Traits::kUpInputSlots * Traits::UpGemm::kTileShapeK;
         if (WarpRole::is_other_loader_thread()) {
             if constexpr (Traits::kUseLatent) {
-                workspace->handoff.wait_latent_tasks(
+                workspace->cta_comm.wait_latent_tasks(
                     smem->launch_parity, Traits::LatentDownGemm::kNumCtas);
             }
             if constexpr (Traits::kLatentQuantizeOutput) {
@@ -658,7 +657,7 @@ struct CollectiveMainloopMoE {
             prefetch_tma_descriptors(params);
         } else if (warp_idx == 3 && lane_idx == 0) {
             // Per-CTA private launch counter.
-            smem->launch_parity = workspace->handoff.claim_parity();
+            smem->launch_parity = workspace->cta_comm.claim_parity();
             // The down task queue starts empty.
             smem->down_tasks_claimed = 0u;
             smem->down_task_stores = 0u;
@@ -685,7 +684,7 @@ struct CollectiveMainloopMoE {
             // covered.
             for (std::uint32_t rank = blockIdx.x * kZeroThreads + zero_tid;
                  rank < Workspace::kMaxRoutedRows; rank += kZeroThreads) {
-                workspace->handoff.reset_inactive(launch_parity, rank);
+                workspace->cta_comm.reset_inactive(launch_parity, rank);
             }
         }
     }
@@ -723,10 +722,10 @@ struct CollectiveMainloopMoE {
             for (std::uint32_t flat = first_cell; flat < num_cells;
                  flat += cell_stride) {
                 const std::uint32_t tok = flat / kDownOutputColsPerCta;
-                workspace->handoff.wait_down_out_field(
+                workspace->cta_comm.wait_down_out_field(
                     smem->launch_parity, m_block,
-                    tok * TokenCountFields<Dims>::kBits,
-                    TokenCountFields<Dims>::kMask, top_k);
+                    tok * PackedTokenCounts<Dims>::kBits,
+                    PackedTokenCounts<Dims>::kMask, top_k);
                 gather_cell(workspace, activations_out, tok,
                             base_col + flat % kDownOutputColsPerCta, top_k);
             }
@@ -736,8 +735,9 @@ struct CollectiveMainloopMoE {
         // Readiness wait: this block's m-block completes once every active
         // expert's task of it has been published.
         if (threadIdx.x == 0) {
-            workspace->handoff.wait_down_out(smem->launch_parity, m_block,
-                                             smem->routing.active_expert_count);
+            workspace->cta_comm.wait_down_out(
+                smem->launch_parity, m_block,
+                smem->routing.active_expert_count);
         }
         __syncthreads();
 
