@@ -94,7 +94,7 @@ __device__ inline void load_down_weight_scale_per_expert(
         const uint32_t rb =
             (base_m +
              m_tile * MoEKernelTraits<Dims>::DownGemm::MmaCore::kAtomShapeM) /
-            Dims::kQuantBlockM;
+            Dims::kQuantBlock;
         dest[m_tile][k_block] =
             expert_scales_down[expert_id * kNumScaleBlocksM * kNumScaleBlocksK +
                                rb * kNumScaleBlocksK + k_block];
@@ -142,9 +142,9 @@ struct DownProjection {
                   "The down weight ring must alias whole groups of up weight "
                   "slots.");
 
-    static_assert(kTileShapeM % Dims::kQuantBlockM == 0u &&
-                      128u % Dims::kQuantBlockM == 0u,
-                  "The down-proj m-tile base must be kQuantBlockM-aligned for "
+    static_assert(kTileShapeM % Dims::kQuantBlock == 0u &&
+                      128u % Dims::kQuantBlock == 0u,
+                  "The down-proj m-tile base must be kQuantBlock-aligned for "
                   "the per-m-tile weight-scale load.");
     static_assert(Dims::kNumTokens <= 16, "SM100 down-proj supports BS<=16.");
 

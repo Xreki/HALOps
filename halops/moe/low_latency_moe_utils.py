@@ -14,7 +14,7 @@
 # limitations under the License.
 """
 
-from typing import Optional, Sequence, Union
+from typing import Sequence, Union
 
 import torch
 
@@ -71,21 +71,6 @@ def _pack_router_gate(router_weight: torch.Tensor, tile_m: int) -> torch.Tensor:
         .reshape(t, b, tile_m, _ROUTER_SWIZZLE_K)
         .contiguous()
     )
-
-
-def _prepare_latent_down_weight(
-    latent_down_weight: torch.Tensor, device: Optional[torch.device] = None
-) -> torch.Tensor:
-    """Transpose the fp8 latent down weight ``[H, L]`` into ``[L, H]``."""
-    if latent_down_weight.dim() != 2:
-        raise ValueError(
-            "latent_down_weight must be 2-D [hidden_size, latent_size], got "
-            f"{tuple(latent_down_weight.shape)}."
-        )
-    packed = latent_down_weight.transpose(0, 1).contiguous()
-    if device is not None:
-        packed = packed.to(device)
-    return packed
 
 
 def _pack_router_weight(

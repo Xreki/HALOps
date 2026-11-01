@@ -86,7 +86,7 @@ struct LatentDownOutput<Dims, true> {
         MoEKernelTraits<Dims>::kLboChunkK;
     static constexpr std::uint32_t kNumChunks = kNumCols / kLboChunk;
     static constexpr std::uint32_t kNumScaleBlocks =
-        kNumCols / Dims::kQuantBlockM;
+        kNumCols / Dims::kQuantBlock;
 
     alignas(16) Element data[kNumChunks][kNumRows + 1u][kLboChunk];
     alignas(16) ElementScale scale[kNumScaleBlocks][kNumRows];

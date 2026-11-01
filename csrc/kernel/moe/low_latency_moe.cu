@@ -73,7 +73,7 @@ void CheckRouterShape(const torch::Tensor& router_weight) {
 template <typename MoEDims>
 void CheckLatentDownShape(const torch::Tensor& latent_down_weight,
                           const torch::Tensor& latent_down_weight_scale) {
-    using Quant = moe::QuantTraits<MoEDims::kLatentQuant>;
+    using Quant = moe::QuantSpec<MoEDims::kLatentQuant>;
     constexpr bool kUint8Scale =
         std::is_same_v<typename Quant::ScaleType, std::uint8_t>;
     constexpr auto kScaleShape =
@@ -105,8 +105,8 @@ void CheckRoutedExpertShape(const torch::Tensor& expert_up_weights,
     constexpr std::int64_t kExperts = MoEDims::kNumExperts;
     constexpr std::int64_t kIntermediate = MoEDims::kIntermediateSize;
     constexpr std::int64_t kExpertK = moe::MoEInputSize<MoEDims>::value;
-    constexpr std::int64_t kBlockM = MoEDims::kQuantBlockM;
-    constexpr std::int64_t kBlockK = MoEDims::kQuantBlockK;
+    constexpr std::int64_t kBlockM = MoEDims::kQuantBlock;
+    constexpr std::int64_t kBlockK = MoEDims::kQuantBlock;
     constexpr std::int64_t kUpRows = 2 * kIntermediate;
     TORCH_CHECK(expert_up_weights.dim() == 3 &&
                     expert_up_weights.size(0) == kExperts &&
@@ -144,8 +144,8 @@ void CheckSharedExpertShape(const torch::Tensor& input,
                   "this interface takes the shared expert's operands, so the "
                   "schedule it builds must run the shared expert.");
     constexpr std::int64_t kUpRows = 2 * MoEDims::kIntermediateSize;
-    constexpr std::int64_t kBlockM = MoEDims::kQuantBlockM;
-    constexpr std::int64_t kBlockK = MoEDims::kQuantBlockK;
+    constexpr std::int64_t kBlockM = MoEDims::kQuantBlock;
+    constexpr std::int64_t kBlockK = MoEDims::kQuantBlock;
     TORCH_CHECK(shared_up_weight.dim() == 2 &&
                     shared_up_weight.size(0) == kUpRows &&
                     shared_up_weight.size(1) == MoEDims::kHiddenSize,
@@ -243,71 +243,88 @@ uint32_t CalculateGridSize(int device, cudaStream_t stream) {
     return grid_size;
 }
 
-// One 2-D SW128 TMA descriptor: `inner` is the contiguous extent, `outer`
-// the row axis, and `row_bytes` the global stride between rows.
-static CUtensorMap CreateTmaDesc2D(const void* ptr, CUtensorMapDataType type,
-                                   const char* what, uint64_t inner,
-                                   uint64_t outer, uint64_t row_bytes,
-                                   uint32_t box_inner, uint32_t box_outer) {
+// One 2-D TMA descriptor for a row-major tensor: `rows` is the row count,
+// `cols` the contiguous row length, and `row_stride` the byte stride
+// between rows.
+static CUtensorMap CreateTmaDesc2D(const char* debug_name,
+                                   const void* global_ptr,
+                                   CUtensorMapDataType data_type, uint64_t rows,
+                                   uint64_t cols, uint64_t row_stride,
+                                   uint32_t box_rows, uint32_t box_cols,
+                                   bool use_swizzle = true) {
     CUtensorMap desc{};
-    uint64_t global_dim[2] = {inner, outer};
-    uint64_t global_strides[1] = {row_bytes};
-    uint32_t box_dim[2] = {box_inner, box_outer};
+    uint64_t global_shape[2] = {cols, rows};
+    uint64_t global_strides[1] = {row_stride};
+    uint32_t box_dim[2] = {box_cols, box_rows};
     uint32_t element_strides[2] = {1u, 1u};
     const CUresult res = cuTensorMapEncodeTiled(
-        &desc, type, 2, const_cast<void*>(ptr), global_dim, global_strides,
-        box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ", what,
-                ": CUresult=", static_cast<int>(res), " (inner=", inner,
-                ", outer=", outer, ", box=(", box_inner, ", ", box_outer, "))");
+        &desc, data_type, 2, const_cast<void*>(global_ptr), global_shape,
+        global_strides, box_dim, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        use_swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed for ",
+                debug_name, ": CUresult=", static_cast<int>(res),
+                " (rows=", rows, ", cols=", cols, ", box=(", box_rows, ", ",
+                box_cols, "))");
     return desc;
 }
 
 CUtensorMap CreateUpWeightTmaDesc(const void* weights_ptr, uint32_t num_experts,
-                                  uint32_t n, uint32_t k, uint32_t row_box) {
+                                  uint32_t n, uint32_t k, uint32_t box_rows) {
     return CreateTmaDesc2D(
-        weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, "up-projection weights",
-        /*inner=*/k,
-        /*outer=*/static_cast<uint64_t>(num_experts) * 2ULL * n,
-        /*row_bytes=*/k, /*box_inner=*/128u, /*box_outer=*/row_box);
+        "up-projection weights", weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        /*rows=*/static_cast<uint64_t>(num_experts) * 2ULL * n,
+        /*cols=*/k,
+        /*row_stride=*/k, /*box_rows=*/box_rows, /*box_cols=*/128u);
 }
 
 CUtensorMap CreateActivationsTmaDesc(const void* activations_ptr,
-                                     uint32_t batch_size_cap,
-                                     uint32_t block_rows, uint32_t K_hidden) {
-    return CreateTmaDesc2D(activations_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                           "activations",
-                           /*inner=*/K_hidden, /*outer=*/batch_size_cap,
-                           /*row_bytes=*/static_cast<uint64_t>(K_hidden) * 2ULL,
-                           /*box_inner=*/64u, /*box_outer=*/block_rows);
+                                     uint32_t batch_size_cap, uint32_t box_rows,
+                                     uint32_t K_hidden) {
+    return CreateTmaDesc2D(
+        "activations", activations_ptr, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        /*rows=*/batch_size_cap, /*cols=*/K_hidden,
+        /*row_stride=*/static_cast<uint64_t>(K_hidden) * 2ULL,
+        /*box_rows=*/box_rows, /*box_cols=*/64u);
 }
 
 CUtensorMap CreateDownWeightTmaDesc(const void* weights_ptr,
                                     uint32_t num_experts, uint32_t k,
-                                    uint32_t n, uint32_t row_box) {
+                                    uint32_t n, uint32_t box_rows) {
     return CreateTmaDesc2D(
-        weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, "down-projection weights",
-        /*inner=*/n, /*outer=*/static_cast<uint64_t>(num_experts) * k,
-        /*row_bytes=*/n, /*box_inner=*/128u, /*box_outer=*/row_box);
+        "down-projection weights", weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        /*rows=*/static_cast<uint64_t>(num_experts) * k, /*cols=*/n,
+        /*row_stride=*/n, /*box_rows=*/box_rows, /*box_cols=*/128u);
 }
 
 CUtensorMap CreateLatentDownWeightTmaDesc(const void* weights_ptr, uint32_t m,
-                                          uint32_t k, uint32_t row_box) {
+                                          uint32_t k, uint32_t box_rows) {
     return CreateTmaDesc2D(
-        weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8, "latent-projection weights",
-        /*inner=*/k, /*outer=*/m,
-        /*row_bytes=*/k, /*box_inner=*/128u, /*box_outer=*/row_box);
+        "latent-projection weights", weights_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+        /*rows=*/m, /*cols=*/k,
+        /*row_stride=*/k, /*box_rows=*/box_rows, /*box_cols=*/128u);
+}
+
+CUtensorMap CreateLatentDownScaleTmaDesc(const void* scale_ptr,
+                                         CUtensorMapDataType type,
+                                         uint32_t rows, uint32_t cols,
+                                         uint32_t box_rows, uint32_t box_cols) {
+    const std::uint64_t row_stride =
+        static_cast<std::uint64_t>(cols) *
+        (type == CU_TENSOR_MAP_DATA_TYPE_FLOAT32 ? sizeof(float) : 1u);
+    return CreateTmaDesc2D(
+        "latent-projection scales", scale_ptr, type, /*rows=*/rows,
+        /*cols=*/cols, /*row_stride=*/row_stride, /*box_rows=*/box_rows,
+        /*box_cols=*/box_cols, /*use_swizzle=*/false);
 }
 
 CUtensorMap CreateDownActivationTmaDesc(const void* activations_ptr,
-                                        uint32_t temp_rows, uint32_t block_rows,
+                                        uint32_t temp_rows, uint32_t box_rows,
                                         uint32_t n) {
     return CreateTmaDesc2D(
-        activations_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-        "down-projection activations", /*inner=*/n, /*outer=*/temp_rows,
-        /*row_bytes=*/n, /*box_inner=*/128u, /*box_outer=*/block_rows);
+        "down-projection activations", activations_ptr,
+        CU_TENSOR_MAP_DATA_TYPE_UINT8, /*rows=*/temp_rows, /*cols=*/n,
+        /*row_stride=*/n, /*box_rows=*/box_rows, /*box_cols=*/128u);
 }
 
 template <typename MoEDims>
@@ -389,7 +406,7 @@ void MoEImpl(const torch::Tensor& input, const torch::Tensor& router_weight,
                                         latent_down_weight.const_data_ptr())
                                   : nullptr;
     using LatentScale =
-        typename moe::LatentDownGemmTraits<MoEDims>::ScaleElement;
+        typename moe::LatentDownGemmTraits<MoEDims>::ElementScale;
     args.latent_down_weight_scale =
         MoEDims::kUseLatent ? static_cast<const LatentScale*>(
                                   latent_down_weight_scale.const_data_ptr())
@@ -535,19 +552,18 @@ void LowLatencyMoE(const torch::Tensor& input,
                 "latent_down_weight and latent_down_weight_scale.");
     if (num_tokens <= 8) {
         if (latent_mxfp8) {
-            launch_func(
-                moe::Dims_BS8_E512_N512_K2048_SM100<true,
-                                                    moe::QuantMode::kMXFP8>{});
+            launch_func(moe::Dims_BS8_E512_N512_K2048_SM100<
+                        true, moe::QuantMethod::kMXFP8>{});
         } else {
             launch_func(moe::Dims_BS8_E512_N512_K2048_SM100<
-                        true, moe::QuantMode::kBlockwiseFP8>{});
+                        true, moe::QuantMethod::kBlockwiseFP8>{});
         }
     } else {
         TORCH_CHECK(!latent_mxfp8,
                     "moe: mxfp8 latent weights need num_tokens <= 8 in this "
                     "build.");
         launch_func(moe::Dims_BS16_E512_N512_K2048_SM100<
-                    true, moe::QuantMode::kBlockwiseFP8>{});
+                    true, moe::QuantMethod::kBlockwiseFP8>{});
     }
 }
 

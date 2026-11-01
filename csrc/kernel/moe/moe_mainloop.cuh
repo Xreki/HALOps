@@ -66,7 +66,7 @@ struct CollectiveMainloopMoE {
         const DataType::ElementW* shared_down_weight;
         const DataType::ElementScale* shared_down_weight_scale;
         const typename Traits::LatentDownGemm::MmaElement* latent_down_weight;
-        const typename Traits::LatentDownGemm::ScaleElement*
+        const typename Traits::LatentDownGemm::ElementScale*
             latent_down_weight_scale;
         DataType::ElementOut* routed_out;
         DataType::ElementOut* shared_out;
@@ -93,8 +93,6 @@ struct CollectiveMainloopMoE {
         DataType::ElementOut* __restrict__ activations_out;
         const typename Traits::LatentDownGemm::
             MmaElement* __restrict__ latent_down_weight;
-        const typename Traits::LatentDownGemm::
-            ScaleElement* __restrict__ latent_down_weight_scale;
         const DataType::ElementW* __restrict__ shared_up_weight;
         const DataType::ElementScale* __restrict__ shared_up_scale;
         const DataType::ElementW* __restrict__ shared_down_weight;
@@ -116,6 +114,7 @@ struct CollectiveMainloopMoE {
         alignas(128) CUtensorMap tma_down_weights_desc;
         alignas(128) CUtensorMap tma_down_activations_desc;
         alignas(128) CUtensorMap tma_latent_down_weight_desc;
+        alignas(128) CUtensorMap tma_latent_down_scale_desc;
         alignas(128) CUtensorMap tma_shared_up_desc;
         alignas(128) CUtensorMap tma_shared_down_desc;
     };
@@ -132,7 +131,6 @@ struct CollectiveMainloopMoE {
         params.expert_scales_down = args.expert_down_weights_scale;
         params.activations_out = args.routed_out;
         params.latent_down_weight = args.latent_down_weight;
-        params.latent_down_weight_scale = args.latent_down_weight_scale;
         params.shared_up_weight = args.shared_up_weight;
         params.shared_up_scale = args.shared_up_weight_scale;
         params.shared_down_weight = args.shared_down_weight;
@@ -175,21 +173,21 @@ struct CollectiveMainloopMoE {
         // one box per atom.
         params.tma_input_desc = CreateActivationsTmaDesc(
             reinterpret_cast<const void*>(args.input), args.num_tokens,
-            /*block_rows=*/8u, Dims::kHiddenSize);
+            /*box_rows=*/8u, Dims::kHiddenSize);
         if constexpr (Traits::kUseLatent && !Traits::kLatentQuantizeOutput) {
             params.tma_latent_out_desc = CreateActivationsTmaDesc(
                 reinterpret_cast<const void*>(
                     reinterpret_cast<Workspace*>(args.workspace)
                         ->latent_down_out.data_ptr()),
-                Dims::kNumTokens, /*block_rows=*/8u, Dims::kLatentSize);
+                Dims::kNumTokens, /*box_rows=*/8u, Dims::kLatentSize);
         }
-        // row_box pinned to 128: the down tile's M can exceed the
+        // box_rows pinned to 128: the down tile's M can exceed the
         // 256-row boxDim cap.
         params.tma_down_weights_desc = CreateDownWeightTmaDesc(
             reinterpret_cast<const void*>(args.expert_down_weights),
             Dims::kNumExperts, MoEInputSize<Dims>::value,
             Dims::kIntermediateSize,
-            /*row_box=*/128u);
+            /*box_rows=*/128u);
         // The down activations live inside the scratchpad at
         // kUpOutFp8Offset.
         params.tma_down_activations_desc = CreateDownActivationTmaDesc(
@@ -207,7 +205,7 @@ struct CollectiveMainloopMoE {
                     reinterpret_cast<const void*>(args.shared_down_weight),
                     /*num_experts=*/1u, Dims::kHiddenSize,
                     Dims::kIntermediateSize,
-                    /*row_box=*/SharedDownGemmTraits<Dims>::kTileShapeM);
+                    /*box_rows=*/SharedDownGemmTraits<Dims>::kTileShapeM);
             }
         }
         if (args.latent_down_weight != nullptr) {
@@ -215,6 +213,28 @@ struct CollectiveMainloopMoE {
                 reinterpret_cast<const void*>(args.latent_down_weight),
                 Dims::kLatentSize, Dims::kHiddenSize,
                 Traits::LatentDownGemm::kTileShapeM);
+        }
+        if (args.latent_down_weight_scale != nullptr) {
+            if constexpr (Dims::kLatentQuant == QuantMethod::kMXFP8) {
+                params.tma_latent_down_scale_desc =
+                    CreateLatentDownScaleTmaDesc(
+                        reinterpret_cast<const void*>(
+                            args.latent_down_weight_scale),
+                        CU_TENSOR_MAP_DATA_TYPE_UINT8, Dims::kLatentSize,
+                        Dims::kHiddenSize / 32u, /*box_rows=*/32u,
+                        /*box_cols=*/Dims::kHiddenSize / 32u);
+            } else {
+                params.tma_latent_down_scale_desc =
+                    CreateLatentDownScaleTmaDesc(
+                        reinterpret_cast<const void*>(
+                            args.latent_down_weight_scale),
+                        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+                        Dims::kLatentSize / Dims::kQuantBlock,
+                        Dims::kHiddenSize / Dims::kQuantBlock,
+                        /*box_rows=*/1u,
+                        /*box_cols=*/Dims::kHiddenSize / Dims::kQuantBlock /
+                            Traits::LatentDownGemm::kNumSplits);
+            }
         }
         return params;
     }
@@ -225,7 +245,8 @@ struct CollectiveMainloopMoE {
                                     SharedStorage* __restrict__ smem) {
         if constexpr (Traits::kUseLatent) {
             Latent::run(params.tma_latent_down_weight_desc,
-                        params.tma_input_desc, params.latent_down_weight_scale,
+                        params.tma_latent_down_scale_desc,
+                        params.tma_input_desc,
                         reinterpret_cast<Workspace*>(params.scratchpad), smem,
                         static_cast<std::uint32_t>(params.token_count));
         }
@@ -456,7 +477,7 @@ struct CollectiveMainloopMoE {
                                             int batch_size) {
         quantize_fp8_groupwise_128<
             /*Staged=*/false, Dims::kNumTokens, Dims::kLatentSize,
-            Traits::UpGemm::kGemmN, Dims::kQuantBlockK, /*SwizzleBoxK=*/1u,
+            Traits::UpGemm::kGemmN, Dims::kQuantBlock, /*SwizzleBoxK=*/1u,
             /*BlocksPerStage=*/Traits::kQuantBlocksPerTile>(
             reinterpret_cast<const DataType::ElementA*>(
                 &smem->routed_experts.input.data[0][0][0]),
@@ -485,7 +506,7 @@ struct CollectiveMainloopMoE {
                                       int batch_size) {
         constexpr std::uint32_t kInputTileK = Traits::UpGemm::kTileShapeK;
         constexpr std::uint32_t kBlocksPerTile =
-            kInputTileK / Dims::kQuantBlockK;
+            kInputTileK / Dims::kQuantBlock;
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
 #pragma unroll 1
         for (std::uint32_t tile = 0; tile < num_tiles; ++tile) {
@@ -493,7 +514,7 @@ struct CollectiveMainloopMoE {
             smem->barriers.up_input_slot_ready.wait(tile);
             quantize_fp8_groupwise_128<
                 /*Staged=*/true, Dims::kNumTokens, kInputTileK,
-                Traits::UpGemm::kGemmN, Dims::kQuantBlockK,
+                Traits::UpGemm::kGemmN, Dims::kQuantBlock,
                 SwizzleBoxK<DataType::ElementA>::value, kBlocksPerTile>(
                 &smem->routed_experts.input.data[slot][0][0][0],
                 tile * kInputTileK,

@@ -94,7 +94,7 @@ __device__ inline void load_up_weight_scale_per_expert_async(
         uint32_t rb_local = i / kNumScaleBlocksK;
         uint32_t kb = i % kNumScaleBlocksK;
         uint32_t row = base_row_up + rb_local * Dims::kIntermediateSize;
-        uint32_t rb_global = row / Dims::kQuantBlockM;
+        uint32_t rb_global = row / Dims::kQuantBlock;
         const DataType::ElementScale* src =
             &expert_scales_up[expert_id * kNumScaleBlocksM * kNumScaleBlocksK +
                               rb_global * kNumScaleBlocksK + kb];

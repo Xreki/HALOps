@@ -14,7 +14,7 @@
 
 #pragma once
 
-// Quantization recipe of the MoE operator: one mode per weight group.  The
+// Quantization recipe of the MoE operator: one method per weight group.  The
 // public recipe strings are the ones halops.moe speaks; this header is the
 // single place that maps them onto the host dispatch and the supported set.
 
@@ -28,9 +28,9 @@
 namespace halops::moe {
 
 struct MoERecipe {
-    QuantMode experts;
-    QuantMode latent_down;
-    QuantMode shared;
+    QuantMethod experts;
+    QuantMethod latent_down;
+    QuantMethod shared;
 };
 
 constexpr bool operator==(const MoERecipe& lhs, const MoERecipe& rhs) {
@@ -38,49 +38,52 @@ constexpr bool operator==(const MoERecipe& lhs, const MoERecipe& rhs) {
            lhs.shared == rhs.shared;
 }
 
-inline constexpr MoERecipe kBlockwiseRecipe{QuantMode::kBlockwiseFP8,
-                                            QuantMode::kBlockwiseFP8,
-                                            QuantMode::kBlockwiseFP8};
+inline constexpr MoERecipe kBlockwiseRecipe{QuantMethod::kBlockwiseFP8,
+                                            QuantMethod::kBlockwiseFP8,
+                                            QuantMethod::kBlockwiseFP8};
 
 // Recipes this build implements.  Extended one kernel milestone at a time.
-inline constexpr MoERecipe kLatentMXFP8Recipe{
-    QuantMode::kBlockwiseFP8, QuantMode::kMXFP8, QuantMode::kBlockwiseFP8};
+inline constexpr MoERecipe kLatentMXFP8Recipe{QuantMethod::kBlockwiseFP8,
+                                              QuantMethod::kMXFP8,
+                                              QuantMethod::kBlockwiseFP8};
 
 inline constexpr std::array<MoERecipe, 2> kSupportedRecipes{kBlockwiseRecipe,
                                                             kLatentMXFP8Recipe};
 
-inline bool ParseQuantMode(std::string_view name, QuantMode& mode) {
+inline bool ParseQuantMethod(std::string_view name, QuantMethod& method) {
     if (name == "w8a8-blockwise") {
-        mode = QuantMode::kBlockwiseFP8;
+        method = QuantMethod::kBlockwiseFP8;
         return true;
     }
     if (name == "w8a8-mxfp8") {
-        mode = QuantMode::kMXFP8;
+        method = QuantMethod::kMXFP8;
         return true;
     }
     if (name == "w4a8-mxfp4") {
-        mode = QuantMode::kMXFP4;
+        method = QuantMethod::kMXFP4;
         return true;
     }
     return false;
 }
 
-inline const char* QuantModeName(QuantMode mode) {
-    switch (mode) {
-        case QuantMode::kBlockwiseFP8:
+inline const char* QuantMethodName(QuantMethod method) {
+    switch (method) {
+        case QuantMethod::kBlockwiseFP8:
             return "w8a8-blockwise";
-        case QuantMode::kMXFP8:
+        case QuantMethod::kMXFP8:
             return "w8a8-mxfp8";
-        case QuantMode::kMXFP4:
+        case QuantMethod::kMXFP4:
             return "w4a8-mxfp4";
+        case QuantMethod::kNone:
+            return "none";
     }
     return "?";
 }
 
 inline std::string RecipeToString(const MoERecipe& recipe) {
-    return std::string("experts=") + QuantModeName(recipe.experts) +
-           ",latent_down=" + QuantModeName(recipe.latent_down) +
-           ",shared=" + QuantModeName(recipe.shared);
+    return std::string("experts=") + QuantMethodName(recipe.experts) +
+           ",latent_down=" + QuantMethodName(recipe.latent_down) +
+           ",shared=" + QuantMethodName(recipe.shared);
 }
 
 inline std::string SupportedRecipesToString() {
@@ -103,7 +106,7 @@ inline bool IsSupportedRecipe(const MoERecipe& recipe) {
     return false;
 }
 
-// Parses the wire form "experts=<mode>,latent_down=<mode>,shared=<mode>".
+// Parses the wire form "experts=<method>,latent_down=<method>,shared=<method>".
 inline bool ParseRecipe(std::string_view encoded, MoERecipe& recipe,
                         std::string& error) {
     bool seen[3] = {false, false, false};
@@ -120,21 +123,21 @@ inline bool ParseRecipe(std::string_view encoded, MoERecipe& recipe,
         }
         const std::string_view group = item.substr(0, eq);
         const std::string_view name = item.substr(eq + 1);
-        QuantMode mode{};
-        if (!ParseQuantMode(name, mode)) {
+        QuantMethod method{};
+        if (!ParseQuantMethod(name, method)) {
             error = "unknown recipe '" + std::string(name) + "'";
             return false;
         }
         int index = -1;
         if (group == "experts") {
             index = 0;
-            recipe.experts = mode;
+            recipe.experts = method;
         } else if (group == "latent_down") {
             index = 1;
-            recipe.latent_down = mode;
+            recipe.latent_down = method;
         } else if (group == "shared") {
             index = 2;
-            recipe.shared = mode;
+            recipe.shared = method;
         } else {
             error = "unknown group '" + std::string(group) + "'";
             return false;

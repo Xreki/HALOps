@@ -182,7 +182,6 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
                   "one 128-K block is four 32-K sub-blocks");
     constexpr std::uint32_t kChunksPerBlock = QuantBlock / 16u;
     constexpr std::uint32_t kSubBlocks = QuantBlock / 32u;
-    constexpr float kFp8Max = 448.f;
     constexpr float kFp8MaxInv = 1.0f / 448.f;
     const std::uint32_t lane = WarpRole::get_lane_idx();
     const std::uint32_t col = lane * 4u;
@@ -235,21 +234,26 @@ __device__ inline void quantize_mxfp8_groupwise_1x32(
         local_max =
             fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, 4, 8));
         const float blk_max = fmaxf(local_max, 1e-10f);
-        // UE8M0: round the exponent up, matching group_wise_quant's recipe.
-        const float biased_f = fminf(
-            fmaxf(ceilf(log2f(blk_max * kFp8MaxInv)) + 127.0f, 0.0f), 254.0f);
-        const float inv_scale = exp2f(127.0f - biased_f);
+        // UE8M0: ceil(log2(blk_max / 448)) + 127 is the exponent field, plus
+        // one when the mantissa is non-zero.
+        const std::uint32_t scaled_bits = __float_as_uint(blk_max * kFp8MaxInv);
+        const std::uint32_t exp_field = (scaled_bits >> 23) & 0xFFu;
+        const std::uint32_t round_up = (scaled_bits & 0x7FFFFFu) != 0u;
+        const std::uint32_t raw_biased = exp_field + round_up;
+        const std::uint32_t biased = raw_biased < 254u ? raw_biased : 254u;
+        const float inv_scale = __uint_as_float((254u - biased) << 23);
 
-        quantized_input[slot][kc][row][ki + 0] =
-            (DataType::ElementQA)(v.x * inv_scale);
-        quantized_input[slot][kc][row][ki + 1] =
-            (DataType::ElementQA)(v.y * inv_scale);
-        quantized_input[slot][kc][row][ki + 2] =
-            (DataType::ElementQA)(v.z * inv_scale);
-        quantized_input[slot][kc][row][ki + 3] =
-            (DataType::ElementQA)(v.w * inv_scale);
+        const float4 q = make_float4(v.x * inv_scale, v.y * inv_scale,
+                                     v.z * inv_scale, v.w * inv_scale);
+        const __nv_fp8x2_storage_t lo = __nv_cvt_float2_to_fp8x2(
+            make_float2(q.x, q.y), __NV_SATFINITE, __NV_E4M3);
+        const __nv_fp8x2_storage_t hi = __nv_cvt_float2_to_fp8x2(
+            make_float2(q.z, q.w), __NV_SATFINITE, __NV_E4M3);
+        *reinterpret_cast<std::uint32_t*>(&quantized_input[slot][kc][row][ki]) =
+            static_cast<std::uint32_t>(lo) |
+            (static_cast<std::uint32_t>(hi) << 16);
         if (leader) {
-            *scale = static_cast<std::uint8_t>(biased_f);
+            *scale = static_cast<std::uint8_t>(biased);
         }
     }
 }

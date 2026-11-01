@@ -20,10 +20,11 @@ import torch.nn.functional as F
 
 from halops import (
     get_workspace_for_moe,
+    group_wise_quant,
     low_latency_moe,
     transform_weights_for_moe,
 )
-from halops.moe.low_latency_moe import _normalize_quant_mode, _quantize_latent
+from halops.moe.low_latency_moe import _normalize_quant_mode
 
 _FP8_MAX = 448.0  # e4m3 dynamic range
 
@@ -71,17 +72,6 @@ def _quant_mxfp8_activation(x):
     return (blocks / scale[..., None]).clamp(-448.0, 448.0).reshape(rows, cols), scale
 
 
-def _sf_to_plain(scale_sf, rows, cols):
-    """Decode a CUTLASS SfAtom blob [rows, cols] (uint8) to float scales."""
-    n_tiles, k_tiles = rows // 128, cols // 4
-    blob = scale_sf.reshape(n_tiles, k_tiles, 512).to(torch.int64)
-    r = torch.arange(128, device=scale_sf.device)
-    s = torch.arange(4, device=scale_sf.device)
-    idx = (r[:, None] % 32) * 16 + (r[:, None] // 32) * 4 + s[None, :]
-    vals = blob[:, :, idx].permute(0, 2, 1, 3).reshape(rows, cols)
-    return torch.exp2(vals.float() - 127.0)
-
-
 class MoEParams:
     """One `low_latency_moe` call: the knobs, plus the operands `init_weights` fills."""
 
@@ -120,21 +110,19 @@ class MoEParams:
             torch.randn(e, z, n, device=dev, generator=g) * 0.1
         )
         latent_w = latent_s = None
-        latent_is_packed = False
         if self.use_latent:
-            raw = torch.randn(1, h, z, device=dev, generator=g) * 0.1
+            # The kernel reads [L, H]: quantize in that layout, since a 1x32
+            # MX scale grid cannot be transposed after quantization.
+            raw = torch.randn(1, z, h, device=dev, generator=g) * 0.1
             if self.latent_quant == "w8a8-mxfp8":
-                # A 1x32 scale grid cannot be transposed, so quantize the
-                # already-transposed weight and hand over the kernel layout.
-                latent_w, latent_s = _quantize_latent(
-                    raw[0].bfloat16(), self.latent_quant
+                latent_w, latent_s = group_wise_quant(
+                    raw[0].bfloat16(),
+                    mode=self.latent_quant,
+                    use_swizzle=False,
                 )
-                latent_is_packed = True
             else:
-                # The kernel reads [L, H], so the scales are transposed.
-                lw, ls = _quant_fp8_block_wise(raw)
-                latent_w = lw[0]
-                latent_s = ls[0].t().contiguous()
+                latent_w, latent_s = _quant_fp8_block_wise(raw)
+                latent_w, latent_s = latent_w[0], latent_s[0]
 
         self.router_weight = router
         self.expert_up_weights = w13
@@ -143,7 +131,6 @@ class MoEParams:
         self.expert_down_weights_scale = s2
         self.latent_down_weight = latent_w
         self.latent_down_weight_scale = latent_s
-        self.latent_weight_is_packed = latent_is_packed
 
         shared_up, shared_up_s = _quant_fp8_block_wise(
             torch.randn(1, 2 * n, h, device=dev, generator=g) * 0.1
@@ -290,9 +277,7 @@ class MoERef:
         p = self.moe_params
         if p.latent_quant == "w8a8-mxfp8":
             xq, x_scale = _quant_mxfp8_activation(input)
-            w_scale = _sf_to_plain(
-                p.latent_down_weight_scale, p.latent_size, p.hidden_size // 32
-            )
+            w_scale = torch.exp2(p.latent_down_weight_scale.float() - 127.0)
             xf = (xq.float().reshape(*x_scale.shape, 32) * x_scale[..., None]).reshape(
                 xq.shape
             )
@@ -305,7 +290,7 @@ class MoERef:
         input_fp8, input_scale = _quant_fp8_group_wise(input, group_size=128)
         return self.matmul_fp8(
             input_fp8,
-            p.latent_down_weight.T,
+            p.latent_down_weight,
             input_scale,
             p.latent_down_weight_scale,
         ).bfloat16()
@@ -342,26 +327,13 @@ class MoEFused:
     def __call__(self, input, top_k):
         num_tokens = input.size(0)
         if self.packed_weights is None:
-            # An MXFP8 latent weight is already in the kernel layout; only the
-            # block-wise one goes through the transpose packer.
-            latent_to_pack = (
-                None
-                if self.moe_params.latent_weight_is_packed
-                else self.moe_params.latent_down_weight
-            )
             self.packed_weights = transform_weights_for_moe(
                 self.moe_params.router_weight,
                 self.moe_params.expert_up_weights,
                 self.moe_params.shared_up_weight,
-                latent_to_pack,
                 num_tokens,
                 self.moe_params.num_router_gates,
             )
-        latent_weight = (
-            self.moe_params.latent_down_weight
-            if self.moe_params.latent_weight_is_packed
-            else self.packed_weights.get("latent_down_weight")
-        )
 
         if self.workspace is None:
             self.workspace = get_workspace_for_moe(input)
@@ -389,7 +361,7 @@ class MoEFused:
             self.moe_params.shared_up_weight_scale,
             self.moe_params.shared_down_weight,
             self.moe_params.shared_down_weight_scale,
-            latent_weight,
+            self.moe_params.latent_down_weight,
             self.moe_params.latent_down_weight_scale,
             self.workspace,
             routed_out,

@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 // SM100 keeps the warp-level fp8 MMA (ptxas lowers it to two HMMA.16816
 // ops); CUTLASS gates it on its SM89 arch macro, opened here.
@@ -33,6 +34,8 @@
 #include <cute/atom/mma_traits_sm89.hpp>
 #include <cute/tensor.hpp>
 
+#include "kernel/moe/moe_configs.cuh"
+
 namespace halops::moe {
 
 // K width of one SW128 operand box.
@@ -41,9 +44,10 @@ struct SwizzleBoxK {
     static constexpr std::uint32_t value = 1024u / cute::sizeof_bits_v<T>;
 };
 
-// UE8M0: the byte is a biased power-of-two exponent.
+// UE8M0: the byte is a biased power-of-two exponent, i.e. the fp32 exponent
+// field.  A zero group has a zero scale, which contributes nothing.
 __device__ __forceinline__ float ue8m0_to_float(std::uint8_t biased_exp) {
-    return exp2f(static_cast<float>(biased_exp) - 127.0f);
+    return __uint_as_float(static_cast<std::uint32_t>(biased_exp) << 23);
 }
 
 // The SM100 UMMA instruction for an operand pair.
@@ -90,10 +94,13 @@ struct UmmaAtom<__nv_bfloat16, __nv_bfloat16, ElementAcc, AtomShape, MajorA,
 
 // One SM100 MMA kind: instruction M is 128 (64 for a shorter tile), N is 8,
 // and K is 256 bits of the operand type; the caller's tile may repeat it.
-template <class ElementA, class ElementB, class ElementAcc, class TileShape,
+template <class QuantA, class QuantB, class ElementAcc, class TileShape,
           cute::UMMA::Major MajorA = cute::UMMA::Major::K,
           cute::UMMA::Major MajorB = cute::UMMA::Major::K>
 struct UmmaCore {
+    using ElementA = typename QuantA::ElementType;
+    using ElementB = typename QuantB::ElementType;
+
     static_assert(cute::sizeof_bits_v<ElementA> ==
                       cute::sizeof_bits_v<ElementB>,
                   "both operands must have the same element size");
@@ -198,11 +205,223 @@ struct UmmaCore {
     }
 };
 
-// The SM80 warp-level `mma.sync` kind: m16n8k16, bf16 in, fp32 accumulated
-// in registers, operands loaded from SMEM with `ldmatrix`.
-template <class Element, class ElementAcc, class TileShape,
+// One SM89 warp-level fp8 MMA (m16n8k32, e4m3 in, fp32 accumulate):
+//   D = A @ B^T + D, A: 16x32, B: 8x32, K-major (TN).
+__device__ __forceinline__ void fp8_mma_16x8x32(float (&d)[4],
+                                                uint32_t const (&a)[4],
+                                                uint32_t const (&b)[2]) {
+    cute::SM89_16x8x32_F32E4M3E4M3F32_TN::fma(d[0], d[1], d[2], d[3], a[0],
+                                              a[1], a[2], a[3], b[0], b[1],
+                                              d[0], d[1], d[2], d[3]);
+}
+
+// The warp-level `mma.sync` core: one tile's gemm for a pair of quantized
+// operands.  The fp8 kind is the primary path; unquantized (kNone) operands
+// use the bf16 specialization below.
+template <class QuantA, class QuantB, class ElementAcc, class TileShape,
           std::uint32_t StagedRows = 0u>
 struct HmmaCore {
+    using ElementA = typename QuantA::ElementType;
+    using ElementB = typename QuantB::ElementType;
+    static_assert(cute::is_same_v<ElementA, __nv_fp8_e4m3> &&
+                      cute::is_same_v<ElementB, __nv_fp8_e4m3>,
+                  "the fp8 instruction takes two e4m3 operands");
+    static_assert(cute::is_same_v<ElementAcc, float>,
+                  "the instruction is the fp8 one accumulating in fp32");
+    static_assert((QuantA::kMethod == QuantMethod::kMXFP8) ==
+                      (QuantB::kMethod == QuantMethod::kMXFP8),
+                  "mixed block-wise/MX operand recipes are not wired yet");
+
+    static constexpr std::uint32_t kAtomShapeM = 16u;
+    static constexpr std::uint32_t kAtomShapeN = 8u;
+    static constexpr std::uint32_t kAtomShapeK = 32u;
+
+    static constexpr std::uint32_t kTileShapeM = cute::get<0>(TileShape{});
+    static constexpr std::uint32_t kTileShapeN = cute::get<1>(TileShape{});
+    static constexpr std::uint32_t kTileShapeK = cute::get<2>(TileShape{});
+
+    static_assert(kTileShapeM % kAtomShapeM == 0u,
+                  "the tile's M must be a whole number of instructions");
+    static_assert(kTileShapeN == kAtomShapeN,
+                  "the tile's N is exactly one instruction wide");
+    static_assert(kTileShapeK % kAtomShapeK == 0u,
+                  "the tile's K must be a whole number of instructions");
+
+    static constexpr std::uint32_t kNumAtomMs = kTileShapeM / kAtomShapeM;
+    static constexpr std::uint32_t kNumAtomKs = kTileShapeK / kAtomShapeK;
+
+    static constexpr std::uint32_t kAtomOperandsA =
+        kAtomShapeM * kAtomShapeK / 32u / 4u;  // a0..a3
+    static constexpr std::uint32_t kAtomOperandsB =
+        kAtomShapeN * kAtomShapeK / 32u / 4u;  // b0, b1
+    static constexpr std::uint32_t kAtomElemsC =
+        kAtomShapeM * kAtomShapeN / 32u;
+    static_assert(kAtomOperandsA == 4u && kAtomOperandsB == 2u &&
+                      kAtomElemsC == 4u,
+                  "fp8_mma_16x8x32's register signature");
+
+    using AtomOp = cute::SM89_16x8x32_F32E4M3E4M3F32_TN;
+    // The atom tiled over the tile's M: one atom per 16 rows.
+    using TiledMma = decltype(cute::make_tiled_mma(
+        cute::MMA_Atom<AtomOp>{},
+        cute::Layout<
+            cute::Shape<cute::Int<kNumAtomMs>, cute::_1, cute::_1>>{}));
+
+    // A is a K-major SW128 tile: one box carries one 128-K staging block.
+    static constexpr std::uint32_t kSwizzleBoxK = SwizzleBoxK<ElementA>::value;
+    static_assert(kTileShapeK % kSwizzleBoxK == 0u,
+                  "the tile's K must be a whole number of staging blocks");
+
+    // A 16-B swizzle chunk is the instruction's 4-K lane group.
+    static constexpr std::uint32_t kChunkK = 16u;
+    // The staging's token rows per 16-B chunk.
+    static constexpr std::uint32_t kStagedRows =
+        StagedRows != 0u ? StagedRows : kTileShapeN + 1u;
+    static constexpr std::uint32_t kWeightBlockElems =
+        kTileShapeM * kSwizzleBoxK;
+    static constexpr std::uint32_t kWeightTileElems = kTileShapeM * kTileShapeK;
+    static constexpr std::uint32_t kWeightTileBytes =
+        kWeightTileElems * (cute::sizeof_bits_v<ElementA> / 8u);
+    // One block of the activation staging: the token rows and 16-K chunks.
+    static constexpr std::uint32_t kStagedBlockElems =
+        (kSwizzleBoxK / kChunkK) * kStagedRows * kChunkK;
+
+    // The SW128 weight box's word; the TMA XORs the chunk with the row's bits.
+    __device__ static std::uint32_t const* weight_word(
+        ElementA const* __restrict__ a, std::uint32_t row, std::uint32_t chunk,
+        std::uint32_t inner4) {
+        const std::uint32_t swizzled = chunk ^ (row & 7u);
+        return reinterpret_cast<std::uint32_t const*>(
+            a + row * kSwizzleBoxK + swizzled * kChunkK + inner4 * 4u);
+    }
+
+    // The activation staging's word of (token, 16-K chunk, inner four).
+    __device__ static std::uint32_t const* staged_word(
+        ElementB const* __restrict__ b, std::uint32_t chunk,
+        std::uint32_t token, std::uint32_t inner4) {
+        return reinterpret_cast<std::uint32_t const*>(
+            b + (chunk * kStagedRows + token) * kChunkK + inner4 * 4u);
+    }
+
+    // One 16x8x32 atom: its weight box word and its staged activation.
+    __device__ static void atom_mma(ElementA const* __restrict__ a,
+                                    ElementB const* __restrict__ b,
+                                    std::uint32_t row0, std::uint32_t row1,
+                                    std::uint32_t k, std::uint32_t local,
+                                    std::uint32_t inner4,
+                                    float (&cur)[kAtomElemsC]) {
+        std::uint32_t a_reg[kAtomOperandsA];
+        a_reg[0] = *weight_word(a, row0, 2u * k, inner4);
+        a_reg[1] = *weight_word(a, row1, 2u * k, inner4);
+        a_reg[2] = *weight_word(a, row0, 2u * k + 1u, inner4);
+        a_reg[3] = *weight_word(a, row1, 2u * k + 1u, inner4);
+        std::uint32_t b_reg[kAtomOperandsB];
+        b_reg[0] = *staged_word(b, 2u * k, local, inner4);
+        b_reg[1] = *staged_word(b, 2u * k + 1u, local, inner4);
+        fp8_mma_16x8x32(cur, a_reg, b_reg);
+    }
+
+    // The tile's gemm accumulated into `acc`, this warp's per-atom registers.
+    // Both recipes walk block -> m -> k.  Block-wise scales are constant for
+    // the whole 128-K block, so its four atoms accumulate before one scaling;
+    // MX scales change per 32-K atom, so each atom is scaled on its own.
+    template <std::uint32_t ScaleRows = kTileShapeN, class WeightScale,
+              class ActScale>
+    __device__ static void run(ElementA const* __restrict__ a,
+                               ElementB const* __restrict__ b,
+                               float (&acc)[kNumAtomMs][kAtomElemsC],
+                               WeightScale const* __restrict__ w_scale,
+                               ActScale const* __restrict__ act_scale,
+                               std::uint32_t w_scale_stride = 0u,
+                               std::uint32_t atom_base = 0u) {
+        static_assert(QuantA::kMethod == QuantB::kMethod,
+                      "both operands must use the same recipe");
+        static_assert((QuantA::kMethod == QuantMethod::kBlockwiseFP8 &&
+                       QuantA::kBlockSize == kSwizzleBoxK &&
+                       QuantB::kBlockSize == kSwizzleBoxK) ||
+                          (QuantA::kMethod == QuantMethod::kMXFP8 &&
+                           QuantA::kBlockSize == kAtomShapeK &&
+                           QuantB::kBlockSize == kAtomShapeK),
+                      "the scale type and group must match the recipe");
+        constexpr std::uint32_t kAtoms = kSwizzleBoxK / kAtomShapeK;
+        const std::uint32_t lane_idx = threadIdx.x % 32u;
+        const std::uint32_t local = lane_idx / 4u;
+        const std::uint32_t col = 2u * (lane_idx & 3u);
+        const std::uint32_t inner4 = lane_idx & 3u;
+#pragma unroll
+        for (std::uint32_t block = 0; block < kTileShapeK / kSwizzleBoxK;
+             ++block) {
+            ElementA const* const a_block = a + block * kWeightBlockElems;
+            ElementB const* const b_block = b + block * kStagedBlockElems;
+            std::uint32_t atom0 = 0u;
+            float block_ws = 0.f;
+            float block_as0 = 0.f;
+            float block_as1 = 0.f;
+            float atom_as0[kAtoms];
+            float atom_as1[kAtoms];
+            if constexpr (QuantA::kMethod == QuantMethod::kBlockwiseFP8) {
+                block_ws = w_scale[block];
+                block_as0 = act_scale[block * ScaleRows + col];
+                block_as1 = act_scale[block * ScaleRows + col + 1u];
+            } else {
+                atom0 = atom_base + block * kAtoms;
+#pragma unroll
+                for (std::uint32_t k = 0; k < kAtoms; ++k) {
+                    atom_as0[k] = ue8m0_to_float(
+                        act_scale[(atom0 + k) * ScaleRows + col]);
+                    atom_as1[k] = ue8m0_to_float(
+                        act_scale[(atom0 + k) * ScaleRows + col + 1u]);
+                }
+            }
+#pragma unroll
+            for (std::uint32_t m = 0; m < kNumAtomMs; ++m) {
+                const std::uint32_t row0 = m * kAtomShapeM + local;
+                const std::uint32_t row1 = row0 + kAtomShapeM / 2u;
+                if constexpr (QuantA::kMethod == QuantMethod::kBlockwiseFP8) {
+                    float cur[kAtomElemsC] = {};
+#pragma unroll
+                    for (std::uint32_t k = 0; k < kAtoms; ++k) {
+                        atom_mma(a_block, b_block, row0, row1, k, local, inner4,
+                                 cur);
+                    }
+                    acc[m][0] += cur[0] * block_ws * block_as0;
+                    acc[m][1] += cur[1] * block_ws * block_as1;
+                    acc[m][2] += cur[2] * block_ws * block_as0;
+                    acc[m][3] += cur[3] * block_ws * block_as1;
+                } else {
+                    // The block's four weight scales are one uint32 per row.
+                    const std::uint32_t w0 =
+                        *reinterpret_cast<const std::uint32_t*>(
+                            w_scale + row0 * w_scale_stride + atom0);
+                    const std::uint32_t w1 =
+                        *reinterpret_cast<const std::uint32_t*>(
+                            w_scale + row1 * w_scale_stride + atom0);
+#pragma unroll
+                    for (std::uint32_t k = 0; k < kAtoms; ++k) {
+                        const float ws0 =
+                            ue8m0_to_float((w0 >> (8u * k)) & 0xFFu);
+                        const float ws1 =
+                            ue8m0_to_float((w1 >> (8u * k)) & 0xFFu);
+                        float cur[kAtomElemsC] = {};
+                        atom_mma(a_block, b_block, row0, row1, k, local, inner4,
+                                 cur);
+                        acc[m][0] += cur[0] * ws0 * atom_as0[k];
+                        acc[m][1] += cur[1] * ws0 * atom_as1[k];
+                        acc[m][2] += cur[2] * ws1 * atom_as0[k];
+                        acc[m][3] += cur[3] * ws1 * atom_as1[k];
+                    }
+                }
+            }
+        }
+    }
+};
+
+// The SM80 warp-level kind: m16n8k16, bf16 in, fp32 accumulated in
+// registers, operands loaded from SMEM with `ldmatrix`.
+template <class ElementAcc, class TileShape, std::uint32_t StagedRows>
+struct HmmaCore<QuantSpec<QuantMethod::kNone>, QuantSpec<QuantMethod::kNone>,
+                ElementAcc, TileShape, StagedRows> {
+    using Element = typename QuantSpec<QuantMethod::kNone>::ElementType;
     static_assert(cute::is_same_v<Element, __nv_bfloat16> &&
                       cute::is_same_v<ElementAcc, float>,
                   "the instruction is the bf16 one accumulating in fp32");
@@ -298,207 +517,6 @@ struct HmmaCore {
                            tCrB(cute::_, cute::_, k), tCrC);
             }
         });
-    }
-};
-
-// One SM89 warp-level fp8 MMA (m16n8k32, e4m3 in, fp32 accumulate):
-//   D = A @ B^T + D, A: 16x32, B: 8x32, K-major (TN).
-__device__ __forceinline__ void fp8_mma_16x8x32(float (&d)[4],
-                                                uint32_t const (&a)[4],
-                                                uint32_t const (&b)[2]) {
-    cute::SM89_16x8x32_F32E4M3E4M3F32_TN::fma(d[0], d[1], d[2], d[3], a[0],
-                                              a[1], a[2], a[3], b[0], b[1],
-                                              d[0], d[1], d[2], d[3]);
-}
-
-// The fp8 specialization of the warp-level core: the SM89 MMA
-// (m16n8k32, e4m3 in, fp32 accumulate).
-template <class ElementAcc, class TileShape, std::uint32_t StagedRows>
-struct HmmaCore<__nv_fp8_e4m3, ElementAcc, TileShape, StagedRows> {
-    static_assert(cute::is_same_v<ElementAcc, float>,
-                  "the instruction is the fp8 one accumulating in fp32");
-
-    using Element = __nv_fp8_e4m3;
-
-    static constexpr std::uint32_t kAtomShapeM = 16u;
-    static constexpr std::uint32_t kAtomShapeN = 8u;
-    static constexpr std::uint32_t kAtomShapeK = 32u;
-
-    static constexpr std::uint32_t kTileShapeM = cute::get<0>(TileShape{});
-    static constexpr std::uint32_t kTileShapeN = cute::get<1>(TileShape{});
-    static constexpr std::uint32_t kTileShapeK = cute::get<2>(TileShape{});
-
-    static_assert(kTileShapeM % kAtomShapeM == 0u,
-                  "the tile's M must be a whole number of instructions");
-    static_assert(kTileShapeN == kAtomShapeN,
-                  "the tile's N is exactly one instruction wide");
-    static_assert(kTileShapeK % kAtomShapeK == 0u,
-                  "the tile's K must be a whole number of instructions");
-    static constexpr std::uint32_t kNumAtomMs = kTileShapeM / kAtomShapeM;
-    static constexpr std::uint32_t kNumAtomKs = kTileShapeK / kAtomShapeK;
-
-    static constexpr std::uint32_t kAtomOperandsA =
-        kAtomShapeM * kAtomShapeK / 32u / 4u;  // a0..a3
-    static constexpr std::uint32_t kAtomOperandsB =
-        kAtomShapeN * kAtomShapeK / 32u / 4u;  // b0, b1
-    static constexpr std::uint32_t kAtomElemsC =
-        kAtomShapeM * kAtomShapeN / 32u;
-    static_assert(kAtomOperandsA == 4u && kAtomOperandsB == 2u &&
-                      kAtomElemsC == 4u,
-                  "fp8_mma_16x8x32's register signature");
-
-    using AtomOp = cute::SM89_16x8x32_F32E4M3E4M3F32_TN;
-    // The atom tiled over the tile's M: one atom per 16 rows.
-    using TiledMma = decltype(cute::make_tiled_mma(
-        cute::MMA_Atom<AtomOp>{},
-        cute::Layout<
-            cute::Shape<cute::Int<kNumAtomMs>, cute::_1, cute::_1>>{}));
-
-    // A is a K-major SW128 tile: one box carries one quantization block.
-    static constexpr std::uint32_t kSwizzleBoxK = SwizzleBoxK<Element>::value;
-    static constexpr std::uint32_t kQuantBlockK = 128u;
-    static_assert(kQuantBlockK == kSwizzleBoxK,
-                  "one quantization block must be one SW128 box of K");
-    static_assert(kTileShapeK % kQuantBlockK == 0u,
-                  "the tile's K must be a whole number of quantization blocks");
-    static constexpr std::uint32_t kQuantBlocksPerTile =
-        kTileShapeK / kQuantBlockK;
-    static constexpr std::uint32_t kAtomsPerQuantBlock =
-        kQuantBlockK / kAtomShapeK;
-
-    // A 16-B swizzle chunk is the instruction's 4-K lane group.
-    static constexpr std::uint32_t kChunkK = 16u;
-    static constexpr std::uint32_t kChunksPerQuantBlock =
-        kQuantBlockK / kChunkK;
-    // The staging's token rows per 16-B chunk.
-    static constexpr std::uint32_t kStagedRows =
-        StagedRows != 0u ? StagedRows : kTileShapeN + 1u;
-    static constexpr std::uint32_t kWeightBlockElems =
-        kTileShapeM * kSwizzleBoxK;
-    static constexpr std::uint32_t kWeightTileElems = kTileShapeM * kTileShapeK;
-    static constexpr std::uint32_t kWeightTileBytes =
-        kWeightTileElems * (cute::sizeof_bits_v<Element> / 8u);
-    // One block of the activation staging: the token rows and 16-K chunks.
-    static constexpr std::uint32_t kStagedBlockElems =
-        kChunksPerQuantBlock * kStagedRows * kChunkK;
-
-    // The SW128 weight box's word; the TMA XORs the chunk with the row's bits.
-    __device__ static std::uint32_t const* weight_word(
-        Element const* __restrict__ a, std::uint32_t row, std::uint32_t chunk,
-        std::uint32_t inner4) {
-        const std::uint32_t swizzled = chunk ^ (row & 7u);
-        return reinterpret_cast<std::uint32_t const*>(
-            a + row * kSwizzleBoxK + swizzled * kChunkK + inner4 * 4u);
-    }
-
-    // The activation staging's word of (token, 16-K chunk, inner four).
-    __device__ static std::uint32_t const* staged_word(
-        Element const* __restrict__ b, std::uint32_t chunk, std::uint32_t token,
-        std::uint32_t inner4) {
-        return reinterpret_cast<std::uint32_t const*>(
-            b + (chunk * kStagedRows + token) * kChunkK + inner4 * 4u);
-    }
-
-    // The tile's gemm accumulated into `acc`, this warp's per-atom registers.
-    // The operand scales change every quantization block, so each block
-    // accumulates and is scaled on its own before it is merged into `acc`.
-    template <std::uint32_t ScaleRows = kTileShapeN>
-    __device__ static void run(Element const* __restrict__ a,
-                               Element const* __restrict__ b,
-                               float (&acc)[kNumAtomMs][kAtomElemsC],
-                               float const* __restrict__ w_scale,
-                               float const* __restrict__ act_scale) {
-        const std::uint32_t lane_idx = threadIdx.x % 32u;
-        const std::uint32_t local = lane_idx / 4u;
-        const std::uint32_t col = 2u * (lane_idx & 3u);
-        const std::uint32_t inner4 = lane_idx & 3u;
-#pragma unroll
-        for (std::uint32_t block = 0; block < kQuantBlocksPerTile; ++block) {
-            Element const* const a_block = a + block * kWeightBlockElems;
-            Element const* const b_block = b + block * kStagedBlockElems;
-            const float ws = w_scale[block];
-            const float as0 = act_scale[block * ScaleRows + col];
-            const float as1 = act_scale[block * ScaleRows + col + 1u];
-#pragma unroll
-            for (std::uint32_t m = 0; m < kNumAtomMs; ++m) {
-                const std::uint32_t row0 = m * kAtomShapeM + local;
-                const std::uint32_t row1 = row0 + kAtomShapeM / 2u;
-                float cur[kAtomElemsC] = {};
-#pragma unroll
-                for (std::uint32_t k = 0; k < kAtomsPerQuantBlock; ++k) {
-                    std::uint32_t a_reg[kAtomOperandsA];
-                    a_reg[0] = *weight_word(a_block, row0, 2u * k, inner4);
-                    a_reg[1] = *weight_word(a_block, row1, 2u * k, inner4);
-                    a_reg[2] = *weight_word(a_block, row0, 2u * k + 1u, inner4);
-                    a_reg[3] = *weight_word(a_block, row1, 2u * k + 1u, inner4);
-                    std::uint32_t b_reg[kAtomOperandsB];
-                    b_reg[0] = *staged_word(b_block, 2u * k, local, inner4);
-                    b_reg[1] =
-                        *staged_word(b_block, 2u * k + 1u, local, inner4);
-                    fp8_mma_16x8x32(cur, a_reg, b_reg);
-                }
-                acc[m][0] += cur[0] * ws * as0;
-                acc[m][1] += cur[1] * ws * as1;
-                acc[m][2] += cur[2] * ws * as0;
-                acc[m][3] += cur[3] * ws * as1;
-            }
-        }
-    }
-
-    // MXFP8: one UE8M0 scale per 32-K atom and weight row, applied after each
-    // instruction.  `w_scale` is [row][global 32-K block], `act_scale` is
-    // [global 32-K block][ScaleRows], and `atom_base` is this tile's first
-    // global 32-K block.
-    template <std::uint32_t ScaleRows = kTileShapeN>
-    __device__ static void run_mx(Element const* __restrict__ a,
-                                  Element const* __restrict__ b,
-                                  float (&acc)[kNumAtomMs][kAtomElemsC],
-                                  std::uint8_t const* __restrict__ w_scale,
-                                  std::uint32_t w_scale_stride,
-                                  std::uint8_t const* __restrict__ act_scale,
-                                  std::uint32_t atom_base) {
-        const std::uint32_t lane_idx = threadIdx.x % 32u;
-        const std::uint32_t local = lane_idx / 4u;
-        const std::uint32_t col = 2u * (lane_idx & 3u);
-        const std::uint32_t inner4 = lane_idx & 3u;
-#pragma unroll
-        for (std::uint32_t block = 0; block < kQuantBlocksPerTile; ++block) {
-            Element const* const a_block = a + block * kWeightBlockElems;
-            Element const* const b_block = b + block * kStagedBlockElems;
-#pragma unroll
-            for (std::uint32_t k = 0; k < kAtomsPerQuantBlock; ++k) {
-                const std::uint32_t atom =
-                    atom_base + block * kAtomsPerQuantBlock + k;
-                const float as0 =
-                    ue8m0_to_float(act_scale[atom * ScaleRows + col]);
-                const float as1 =
-                    ue8m0_to_float(act_scale[atom * ScaleRows + col + 1u]);
-#pragma unroll
-                for (std::uint32_t m = 0; m < kNumAtomMs; ++m) {
-                    const std::uint32_t row0 = m * kAtomShapeM + local;
-                    const std::uint32_t row1 = row0 + kAtomShapeM / 2u;
-                    const float ws0 =
-                        ue8m0_to_float(w_scale[row0 * w_scale_stride + atom]);
-                    const float ws1 =
-                        ue8m0_to_float(w_scale[row1 * w_scale_stride + atom]);
-                    float cur[kAtomElemsC] = {};
-                    std::uint32_t a_reg[kAtomOperandsA];
-                    a_reg[0] = *weight_word(a_block, row0, 2u * k, inner4);
-                    a_reg[1] = *weight_word(a_block, row1, 2u * k, inner4);
-                    a_reg[2] = *weight_word(a_block, row0, 2u * k + 1u, inner4);
-                    a_reg[3] = *weight_word(a_block, row1, 2u * k + 1u, inner4);
-                    std::uint32_t b_reg[kAtomOperandsB];
-                    b_reg[0] = *staged_word(b_block, 2u * k, local, inner4);
-                    b_reg[1] =
-                        *staged_word(b_block, 2u * k + 1u, local, inner4);
-                    fp8_mma_16x8x32(cur, a_reg, b_reg);
-                    acc[m][0] += cur[0] * ws0 * as0;
-                    acc[m][1] += cur[1] * ws0 * as1;
-                    acc[m][2] += cur[2] * ws1 * as0;
-                    acc[m][3] += cur[3] * ws1 * as1;
-                }
-            }
-        }
     }
 };
 

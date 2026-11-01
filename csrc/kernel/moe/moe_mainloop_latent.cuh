@@ -43,7 +43,7 @@ struct LatentDownProjectionBase {
 
     static constexpr std::uint32_t kTileShapeM = LatentDownGemm::kTileShapeM;
     static constexpr std::uint32_t kTileShapeN = LatentDownGemm::kTileShapeN;
-    static_assert(kTileShapeM <= Dims::kQuantBlockM,
+    static_assert(kTileShapeM <= Dims::kQuantBlock,
                   "a CTA's rows must sit inside one 128-row weight block");
 
     static constexpr std::uint32_t kNumCtas = LatentDownGemm::kNumCtas;
@@ -74,7 +74,7 @@ struct LatentDownProjectionBase {
     }
 
     __device__ static std::uint32_t tile_idx() {
-        return row_base() / Dims::kQuantBlockM;
+        return row_base() / Dims::kQuantBlock;
     }
 
     static constexpr std::uint32_t kNumSplits = LatentDownGemm::kNumSplits;
@@ -155,52 +155,34 @@ struct LatentDownProjectionBase {
             for (std::uint32_t h = 0; h < kQuantBlocksPerTile; ++h) {
                 tma_load_latent_down_weight_tile(
                     tma_latent_down_weight_desc, row_base(),
-                    k_start + h * Dims::kQuantBlockK,
+                    k_start + h * Dims::kQuantBlock,
                     &smem->latent_down.w_latent_down[slot][h][0][0],
                     smem->barriers.latent_down_weight_ready.raw(slot));
             }
         }
     }
 
+    // The CTA's scale rows are one contiguous byte range, loaded with a single
+    // 2-D TMA: a 128-B float row for block-wise scales, a 32-row 4-KB UE8M0
+    // slab for MXFP8.
     __device__ static void load_weight_scale(
-        const typename LatentDownGemm::
-            ScaleElement* __restrict__ latent_down_weight_scale,
+        CUtensorMap const& tma_latent_down_scale_desc,
         SharedStorage* __restrict__ smem) {
-        if constexpr (LatentDownGemm::kMXFP8) {
-            load_weight_scale_mxfp8(
-                reinterpret_cast<const std::uint8_t*>(latent_down_weight_scale),
-                smem);
-        } else {
-            if (WarpRole::get_warp_idx() != 0u) return;
-            const float* const row =
-                latent_down_weight_scale + tile_idx() * kNumScaleBlocksK;
-            for (std::uint32_t kb = WarpRole::get_lane_idx();
-                 kb < kNumScaleBlocksK; kb += WarpRole::kThreadsPerWarp) {
-                smem->latent_down.w_latent_down_scale[0][kb] = row[kb];
-            }
-        }
-    }
-
-    // SfAtom blob of the CTA's 128-row atom: (row atom, 128-K atom) of 512 B,
-    // then (row % 32) * 16 + (row / 32) * 4 + (k32 % 4).
-    __device__ static void load_weight_scale_mxfp8(
-        const std::uint8_t* __restrict__ scale,
-        SharedStorage* __restrict__ smem) {
-        if (WarpRole::get_warp_idx() != 0u) return;
-        constexpr std::uint32_t kK32 = LatentDownGemm::kMxScaleBlocksK;
-        constexpr std::uint32_t kNumKTiles = kK32 / 4u;
-        static_assert(kTileShapeM == 32u,
-                      "the MX latent scale loader assumes 32-row CTAs");
-        const std::uint32_t n_tile = tile_idx();
-        const std::uint32_t mn_j = (row_base() % Dims::kQuantBlockM) / 32u;
-        for (std::uint32_t idx = WarpRole::get_lane_idx();
-             idx < kTileShapeM * kK32; idx += WarpRole::kThreadsPerWarp) {
-            const std::uint32_t row = idx / kK32;
-            const std::uint32_t k32 = idx % kK32;
-            const std::uint32_t byte = (n_tile * kNumKTiles + k32 / 4u) * 512u +
-                                       row * 16u + mn_j * 4u + (k32 % 4u);
-            smem->latent_down.w_latent_down_scale[row][k32] = scale[byte];
-        }
+        constexpr auto kScaleBytes =
+            LatentDownGemm::WeightQuant::template ScaleBytes<
+                kTileShapeM, LatentDownGemm::kGemmK / kNumSplits>();
+        constexpr std::uint32_t kScaleColsPerSplit =
+            (LatentDownGemm::kGemmK / LatentDownGemm::WeightQuant::kBlockSize) /
+            kNumSplits;
+        if (threadIdx.x != 0u) return;
+        auto& bar = smem->barriers.latent_down_scale_ready;
+        bar.arrive(0u, kScaleBytes);
+        tma_load_latent_down_scale_tile(
+            tma_latent_down_scale_desc, split_idx() * kScaleColsPerSplit,
+            LatentDownGemm::WeightQuant::kMethod == QuantMethod::kMXFP8
+                ? row_base()
+                : tile_idx(),
+            &smem->latent_down.w_latent_down_scale[0][0], bar.raw(0u));
     }
 
     __device__ static void publish(Workspace* __restrict__ workspace,
@@ -325,7 +307,7 @@ struct LatentDownProjectionBase {
         }
         if (owns_scale_row) {
             workspace->latent_down_out.scale_row(
-                row_base() / Dims::kQuantBlockM)[token_begin() + threadIdx.x] =
+                row_base() / Dims::kQuantBlock)[token_begin() + threadIdx.x] =
                 row_scale;
         }
         if (owns_slice) {
@@ -397,17 +379,26 @@ struct LatentDownProjection<KernelTraits, true>
                 cute::_16{}, cute::make_stride(cute::_1{}, cute::Int<kBLbo>{})),
             cute::_0{}, cute::Int<kBKStride>{})));
 
-    __device__ static void run(
-        CUtensorMap const& tma_latent_down_weight_desc,
-        CUtensorMap const& tma_input_desc,
-        const typename LatentDownGemm::
-            ScaleElement* __restrict__ latent_down_weight_scale,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t batch_size) {
+    __device__ static void run(CUtensorMap const& tma_latent_down_weight_desc,
+                               CUtensorMap const& tma_latent_down_scale_desc,
+                               CUtensorMap const& tma_input_desc,
+                               Workspace* __restrict__ workspace,
+                               SharedStorage* __restrict__ smem,
+                               std::uint32_t batch_size) {
         if (!Base::is_latent_cta()) return;
 
-        run_role(tma_latent_down_weight_desc, tma_input_desc,
-                 latent_down_weight_scale, workspace, smem, batch_size);
+        // Issue the scale TMA before any weight tile so the small slab is
+        // not queued behind the weight stream.
+        Base::load_weight_scale(tma_latent_down_scale_desc, smem);
+        if (WarpRole::is_other_loader_thread()) {
+            Base::run_load_input_k_loop(tma_input_desc, smem);
+        } else if (WarpRole::is_weight_loader_thread()) {
+            Base::run_load_weight_k_loop(tma_latent_down_weight_desc, smem);
+        } else if (WarpRole::is_mma_issuer_warp(WarpRole::get_warp_idx())) {
+            run_mma_k_loop(smem, smem->tmem_ptr);
+        } else if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
+            run_quantize_and_dequant_k_loop(smem, workspace, batch_size);
+        }
         if constexpr (LatentDownGemm::kNumSplits > 1u) {
             // Every thread joins: the cluster barrier is block-collective.
             __syncthreads();
@@ -430,32 +421,6 @@ struct LatentDownProjection<KernelTraits, true>
         }
         if constexpr (Traits::kLatentQuantizeOutput) {
             Base::finish_quantized_output(workspace, smem, batch_size);
-        }
-    }
-
-    __device__ static void run_role(
-        CUtensorMap const& tma_latent_down_weight_desc,
-        CUtensorMap const& tma_input_desc,
-        const typename LatentDownGemm::
-            ScaleElement* __restrict__ latent_down_weight_scale,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t batch_size) {
-        if (WarpRole::is_other_loader_thread()) {
-            Base::run_load_input_k_loop(tma_input_desc, smem);
-            return;
-        }
-        if (WarpRole::is_weight_loader_thread()) {
-            Base::run_load_weight_k_loop(tma_latent_down_weight_desc, smem);
-            return;
-        }
-        const std::uint32_t warp_idx = WarpRole::get_warp_idx();
-        if (WarpRole::is_mma_issuer_warp(warp_idx)) {
-            run_mma_k_loop(smem, smem->tmem_ptr);
-            return;
-        }
-        if (WarpRole::is_calc_warp(warp_idx)) {
-            run_quantize_and_dequant_k_loop(smem, latent_down_weight_scale,
-                                            workspace, batch_size);
         }
     }
 
@@ -501,14 +466,14 @@ struct LatentDownProjection<KernelTraits, true>
                                            std::uint32_t batch_size,
                                            std::uint32_t local) {
         constexpr std::uint32_t kBlocksPerTile =
-            Traits::LatentDownGemm::kTileShapeK / Dims::kQuantBlockK;
+            Traits::LatentDownGemm::kTileShapeK / Dims::kQuantBlock;
         const std::uint32_t slot = local % Traits::kLatentInputSlots;
         const std::uint32_t k_iter_id = Base::k_tile(local);
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         smem->barriers.latent_down_input_ready.wait(local);
         quantize_fp8_groupwise_128<
             /*Staged=*/true, kTileShapeN, Traits::LatentDownGemm::kTileShapeK,
-            LatentDownGemm::kGemmN, Dims::kQuantBlockK,
+            LatentDownGemm::kGemmN, Dims::kQuantBlock,
             SwizzleBoxK<DataType::ElementA>::value, kBlocksPerTile>(
             reinterpret_cast<const DataType::ElementA*>(
                 &smem->latent_down.input.data[slot][0][0][0]),
@@ -529,10 +494,8 @@ struct LatentDownProjection<KernelTraits, true>
     }
 
     __device__ static void run_quantize_and_dequant_k_loop(
-        SharedStorage* __restrict__ smem,
-        const typename LatentDownGemm::
-            ScaleElement* __restrict__ latent_down_weight_scale,
-        Workspace* __restrict__ workspace, std::uint32_t batch_size) {
+        SharedStorage* __restrict__ smem, Workspace* __restrict__ workspace,
+        std::uint32_t batch_size) {
         constexpr std::uint32_t kStageAhead = 1u;
         static_assert(kStageAhead < kNumAccSlots,
                       "the drain must stay inside the accumulator ring");
@@ -540,8 +503,8 @@ struct LatentDownProjection<KernelTraits, true>
                       "the staged tile must stay inside the staging ring");
         quantize_k_tile(smem, batch_size, 0u);
 
-        // The pipeline's first tile sync orders this row before any drain.
-        Base::load_weight_scale(latent_down_weight_scale, smem);
+        // The scale TMA issued in run() overlaps the first quantize.
+        smem->barriers.latent_down_scale_ready.wait(0u);
 
         float acc[kTokenWindows][4] = {};
 #pragma unroll 1
@@ -644,11 +607,13 @@ struct LatentDownProjection<KernelTraits, true>
         smem->barriers.accumulator_ready.wait(k_iter_id);
 #pragma unroll
         for (std::uint32_t sub = 0; sub < kQuantBlocksPerTile; ++sub) {
-            // Both scale tables are whole-activation, indexed by the global
-            // block, not by the staging tile.
+            // The activation scale table spans every K block; the weight
+            // scale holds only this split's share.
             const std::uint32_t block =
                 Base::k_tile(k_iter_id) * kQuantBlocksPerTile + sub;
-            const float ws = smem->latent_down.w_latent_down_scale[0][block];
+            const std::uint32_t ws_block =
+                k_iter_id * kQuantBlocksPerTile + sub;
+            const float ws = smem->latent_down.w_latent_down_scale[0][ws_block];
 #pragma unroll
             for (std::uint32_t g = 0; g < kTokenWindows; ++g) {
                 float v[4];
@@ -724,49 +689,32 @@ struct LatentDownProjection<KernelTraits, false>
     using Dims = typename KernelTraits::MoEDims;
     using Traits = KernelTraits;
 
-    static_assert(MmaCore::kQuantBlockK == Dims::kQuantBlockK,
-                  "the instruction's scale blocks must be the input's");
+    static_assert(MmaCore::kSwizzleBoxK == Dims::kQuantBlock,
+                  "the MMA's staging block must match the input's");
     static constexpr std::uint32_t kNumTilesPerWarp =
         (Base::kNumTilesK + WarpRole::kCalcWarpCount - 1u) /
         WarpRole::kCalcWarpCount;
 
-    __device__ static void run(
-        CUtensorMap const& tma_latent_down_weight_desc,
-        CUtensorMap const& tma_input_desc,
-        const typename LatentDownGemm::
-            ScaleElement* __restrict__ latent_down_weight_scale,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t batch_size) {
+    __device__ static void run(CUtensorMap const& tma_latent_down_weight_desc,
+                               CUtensorMap const& tma_latent_down_scale_desc,
+                               CUtensorMap const& tma_input_desc,
+                               Workspace* __restrict__ workspace,
+                               SharedStorage* __restrict__ smem,
+                               std::uint32_t batch_size) {
         if (!Base::is_latent_cta()) return;
 
-        run_role(tma_latent_down_weight_desc, tma_input_desc,
-                 latent_down_weight_scale, workspace, smem, batch_size);
-        if constexpr (Traits::kLatentQuantizeOutput) {
-            Base::finish_quantized_output(workspace, smem, batch_size);
-        }
-    }
-
-    __device__ static void run_role(
-        CUtensorMap const& tma_latent_down_weight_desc,
-        CUtensorMap const& tma_input_desc,
-        const typename LatentDownGemm::
-            ScaleElement* __restrict__ latent_down_weight_scale,
-        Workspace* __restrict__ workspace, SharedStorage* __restrict__ smem,
-        std::uint32_t batch_size) {
+        // Issue the scale TMA before any weight tile so the small slab is
+        // not queued behind the weight stream.
+        Base::load_weight_scale(tma_latent_down_scale_desc, smem);
         if (WarpRole::is_other_loader_thread()) {
             Base::run_load_input_k_loop(tma_input_desc, smem);
-            return;
-        }
-        if (WarpRole::is_weight_loader_thread()) {
+        } else if (WarpRole::is_weight_loader_thread()) {
             Base::run_load_weight_k_loop(tma_latent_down_weight_desc, smem);
-            return;
-        }
-        if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
-            Base::load_weight_scale(latent_down_weight_scale, smem);
-            // The scale table is read by every calc warp; one warp fills it.
-            WarpRole::sync_calc_threads();
-
+        } else if (WarpRole::is_calc_warp(WarpRole::get_warp_idx())) {
             run_hmma_k_loop(workspace, smem, batch_size);
+        }
+        if constexpr (Traits::kLatentQuantizeOutput) {
+            Base::finish_quantized_output(workspace, smem, batch_size);
         }
     }
 
@@ -776,7 +724,7 @@ struct LatentDownProjection<KernelTraits, false>
         constexpr std::uint32_t kInputTileK =
             Traits::LatentDownGemm::kTileShapeK;
         constexpr std::uint32_t kBlocksPerTile =
-            kInputTileK / Dims::kQuantBlockK;
+            kInputTileK / Dims::kQuantBlock;
         static_assert(kBlocksPerTile == LatentDownGemm::kQuantBlocksPerTile,
                       "a K tile must be whole quantization blocks");
 
@@ -784,10 +732,11 @@ struct LatentDownProjection<KernelTraits, false>
         const std::uint32_t staging_slot =
             k_iter_id % Traits::kLatentInputSlots;
         smem->barriers.latent_down_input_ready.wait(k_iter_id);
-        if constexpr (LatentDownGemm::kMXFP8) {
+        if constexpr ((LatentDownGemm::WeightQuant::kMethod ==
+                       QuantMethod::kMXFP8)) {
             quantize_mxfp8_groupwise_1x32<
                 /*Staged=*/true, Base::kTileShapeN, kInputTileK,
-                LatentDownGemm::kGemmN, Dims::kQuantBlockK,
+                LatentDownGemm::kGemmN, Dims::kQuantBlock,
                 SwizzleBoxK<DataType::ElementA>::value, kBlocksPerTile>(
                 reinterpret_cast<const DataType::ElementA*>(
                     &smem->latent_down.input.data[slot][0][0][0]),
@@ -799,7 +748,7 @@ struct LatentDownProjection<KernelTraits, false>
         } else {
             quantize_fp8_groupwise_128<
                 /*Staged=*/true, Base::kTileShapeN, kInputTileK,
-                LatentDownGemm::kGemmN, Dims::kQuantBlockK,
+                LatentDownGemm::kGemmN, Dims::kQuantBlock,
                 SwizzleBoxK<DataType::ElementA>::value, kBlocksPerTile>(
                 reinterpret_cast<const DataType::ElementA*>(
                     &smem->latent_down.input.data[slot][0][0][0]),
@@ -839,6 +788,7 @@ struct LatentDownProjection<KernelTraits, false>
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
 
         float acc[MmaCore::kNumAtomMs][MmaCore::kAtomElemsC] = {};
+        [[maybe_unused]] bool scale_ready = false;
 #pragma unroll 1
         for (std::uint32_t t = 0; t < kNumTilesPerWarp; ++t) {
             const std::uint32_t k_iter_id =
@@ -849,15 +799,23 @@ struct LatentDownProjection<KernelTraits, false>
 
             const std::uint32_t slot = k_iter_id % kNumWeightSlots;
             smem->barriers.latent_down_weight_ready.wait(k_iter_id);
+            if (!scale_ready) {
+                // The TMA scale slab overlaps the first quantize and the
+                // first weight tile's arrival.
+                smem->barriers.latent_down_scale_ready.wait(0u);
+                scale_ready = true;
+            }
             const std::uint32_t quant_block_k = k_iter_id * kQuantBlocksPerTile;
             const std::uint32_t staged = k_iter_id;
-            if constexpr (LatentDownGemm::kMXFP8) {
-                MmaCore::template run_mx<Dims::kNumTokens>(
+            if constexpr ((LatentDownGemm::WeightQuant::kMethod ==
+                           QuantMethod::kMXFP8)) {
+                MmaCore::template run<Dims::kNumTokens>(
                     &smem->latent_down.w_latent_down[slot][0][0][0],
                     Base::staged_block(smem, staged), acc,
                     &smem->latent_down.w_latent_down_scale[0][0],
-                    LatentDownGemm::kMxScaleBlocksK,
                     &smem->latent_down.quantized_input.scale[0][0],
+                    LatentDownGemm::kGemmK /
+                        LatentDownGemm::WeightQuant::kBlockSize,
                     k_iter_id * (LatentDownGemm::kTileShapeK / 32u));
             } else {
                 MmaCore::template run<Dims::kNumTokens>(

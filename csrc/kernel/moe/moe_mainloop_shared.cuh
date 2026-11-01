@@ -360,7 +360,7 @@ struct SharedExpertProjection {
         const std::uint32_t warp_idx = WarpRole::get_calc_warp_idx();
         const std::uint32_t lane_idx = WarpRole::get_lane_idx();
         constexpr std::uint32_t kBlocksPerTile =
-            SharedUpGemm::kTileShapeK / Dims::kQuantBlockK;
+            SharedUpGemm::kTileShapeK / Dims::kQuantBlock;
         const std::uint32_t slot = k_iter_id % kNumUpSlots;
         if (k_iter_id >= kNumUpSlots) {
             smem->barriers.shared_up_weight_empty.wait(k_iter_id - kNumUpSlots);
@@ -373,7 +373,7 @@ struct SharedExpertProjection {
             k_iter_id * kBlocksPerTile;
         quantize_fp8_groupwise_128<
             /*Staged=*/true, Dims::kNumTokens, Dims::kHiddenSize,
-            Dims::kNumTokens, Dims::kQuantBlockK, kInputSwizzleBoxK,
+            Dims::kNumTokens, Dims::kQuantBlock, kInputSwizzleBoxK,
             kBlocksPerTile>(
             reinterpret_cast<const DataType::ElementA*>(
                 &smem->shared_expert.input.data[slot][0][0][0]),
@@ -402,11 +402,11 @@ struct SharedExpertProjection {
         const std::uint32_t lane_base = up_lane_base(warp_idx);
         const bool reads_tile = owns_up_rows(warp_idx);
         const std::uint32_t gate_row =
-            slab_idx() * kActQuantBlock / Dims::kQuantBlockM;
+            slab_idx() * kActQuantBlock / Dims::kQuantBlock;
         const std::uint32_t up_row =
-            Dims::kIntermediateSize / Dims::kQuantBlockM + gate_row;
+            Dims::kIntermediateSize / Dims::kQuantBlock + gate_row;
         constexpr std::uint32_t kScaleBlocksK =
-            Dims::kHiddenSize / Dims::kQuantBlockK;
+            Dims::kHiddenSize / Dims::kQuantBlock;
         const std::uint32_t kblk_base =
             split_idx() * SharedUpGemm::kQuantBlocksPerCta + k_iter_id * 2u;
 #pragma unroll

@@ -32,21 +32,21 @@ namespace halops::moe {
 // Build a `CUtensorMap` for the fp8 up-projection weight `[E, 2*n, k]`.
 CUtensorMap CreateUpWeightTmaDesc(const void* weights_ptr, uint32_t num_experts,
                                   uint32_t n, uint32_t k,
-                                  uint32_t row_box = 128u);
+                                  uint32_t box_rows = 128u);
 
 // Build a `CUtensorMap` for the bf16 activation `[BS, K_hidden]`.
 CUtensorMap CreateActivationsTmaDesc(const void* activations_ptr,
-                                     uint32_t batch_size_cap,
-                                     uint32_t block_rows, uint32_t K_hidden);
+                                     uint32_t batch_size_cap, uint32_t box_rows,
+                                     uint32_t K_hidden);
 
 // Build a `CUtensorMap` for the fp8 down-projection weight `[E, k, n]`.
 CUtensorMap CreateDownWeightTmaDesc(const void* weights_ptr,
                                     uint32_t num_experts, uint32_t k,
-                                    uint32_t n, uint32_t row_box = 128u);
+                                    uint32_t n, uint32_t box_rows = 128u);
 
 // Build a `CUtensorMap` for the fp8 intermediate activation.
 CUtensorMap CreateDownActivationTmaDesc(const void* activations_ptr,
-                                        uint32_t temp_rows, uint32_t block_rows,
+                                        uint32_t temp_rows, uint32_t box_rows,
                                         uint32_t n);
 
 // L2 eviction hint for the expert weights, streamed once per launch: an
@@ -126,7 +126,15 @@ __device__ __forceinline__ void tma_load_down_umma_tile(
 
 // Build a `CUtensorMap` for the shared latent down weight `[m, k]` (fp8).
 CUtensorMap CreateLatentDownWeightTmaDesc(const void* weights_ptr, uint32_t m,
-                                          uint32_t k, uint32_t row_box);
+                                          uint32_t k, uint32_t box_rows);
+
+// Build a `CUtensorMap` for the latent scale `[rows, cols]`: plain UE8M0
+// (`uint8`, `K/32` columns) or block-wise (`float32`, `K/128` columns).
+// `box_cols` narrows the tile to one K split's share of a row.
+CUtensorMap CreateLatentDownScaleTmaDesc(const void* scale_ptr,
+                                         CUtensorMapDataType type,
+                                         uint32_t rows, uint32_t cols,
+                                         uint32_t box_rows, uint32_t box_cols);
 
 // Issue one 128x128 fp8 weight tile of the latent down-projection into SHM.
 __device__ __forceinline__ void tma_load_latent_down_weight_tile(
@@ -134,6 +142,17 @@ __device__ __forceinline__ void tma_load_latent_down_weight_tile(
     std::uint32_t k_start, void* dest_smem_ptr, std::uint64_t* bar_smem_ptr) {
     tma_load_2d(tma_latent_down_weights_desc, /*coord0=*/k_start,
                 /*coord1=*/base_row, dest_smem_ptr, bar_smem_ptr);
+}
+
+// Issue the CTA's scale rows as one 2-D TMA: a 128-B float row (optionally
+// narrowed to the split's share) or a 32-row 4-KB UE8M0 slab.
+__device__ __forceinline__ void tma_load_latent_down_scale_tile(
+    CUtensorMap const& tma_latent_down_scale_desc, std::uint32_t col_start,
+    std::uint32_t row_start, void* dest_smem_ptr, std::uint64_t* bar_smem_ptr) {
+    tma_load_2d(
+        tma_latent_down_scale_desc, /*coord0=*/col_start,
+        /*coord1=*/row_start, dest_smem_ptr, bar_smem_ptr,
+        static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_FIRST));
 }
 
 // Issue one TMA load for up to 8 rows of the fp8 down-projection activation.

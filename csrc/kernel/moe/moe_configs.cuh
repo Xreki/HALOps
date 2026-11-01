@@ -20,26 +20,115 @@
 #include <cutlass/cutlass.h>
 
 #include <cstdint>
+#include <cute/tensor.hpp>
 
 #define FULL_MASK 0xFFFFFFFFU
 
 namespace halops::moe {
 
-// Tensor-core instruction family of an MMA.
 enum class MmaKind : uint32_t {
-    kUmma = 0,  // tcgen05 UMMA on the MMA issuer warp; calc warps stay free
-    kHmma = 1,  // warp-level mma.sync on the calc warps
+    kUmma = 0,
+    kHmma = 1,
 };
 
-// Quantization recipe of one weight group.
-enum class QuantMode : uint32_t {
+enum class QuantMethod : uint32_t {
     kBlockwiseFP8 = 0,
     kMXFP8 = 1,
     kMXFP4 = 2,
+    kNone = 3,
+};
+
+// One operand's quantization scheme: scale method, group width, element and
+// scale types.  `BlockSize` is the scale group (or block) width; MXFP8 and
+// MXFP4 have a fixed 32-element group, so their specialization ignores it.
+template <QuantMethod Method,
+          std::uint32_t BlockSize =
+              (Method == QuantMethod::kBlockwiseFP8 ? 128u : 32u)>
+struct QuantSpec;
+
+template <std::uint32_t BlockSize>
+struct QuantSpec<QuantMethod::kNone, BlockSize> {
+    static constexpr QuantMethod kMethod = QuantMethod::kNone;
+    static constexpr std::uint32_t kBlockSize = 0u;
+    using ElementType = __nv_bfloat16;
+    using ScaleType = void;
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
+        return 0u;
+    }
+};
+
+template <std::uint32_t BlockSize>
+struct QuantSpec<QuantMethod::kBlockwiseFP8, BlockSize> {
+    static constexpr QuantMethod kMethod = QuantMethod::kBlockwiseFP8;
+    static constexpr std::uint32_t kBlockSize = BlockSize;
+    using ElementType = __nv_fp8_e4m3;
+    using ScaleType = float;
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr auto ScaleShape() {
+        return cute::make_shape(cute::Int<(M + BlockSize - 1u) / BlockSize>{},
+                                cute::Int<(N + BlockSize - 1u) / BlockSize>{});
+    }
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
+        constexpr auto kShape = ScaleShape<M, N>();
+        return static_cast<std::uint32_t>(cute::get<0>(kShape)) *
+               static_cast<std::uint32_t>(cute::get<1>(kShape)) *
+               static_cast<std::uint32_t>(sizeof(ScaleType));
+    }
+};
+
+template <std::uint32_t BlockSize>
+struct QuantSpec<QuantMethod::kMXFP8, BlockSize> {
+    static constexpr QuantMethod kMethod = QuantMethod::kMXFP8;
+    static constexpr std::uint32_t kBlockSize = 32u;
+    using ElementType = __nv_fp8_e4m3;
+    using ScaleType = std::uint8_t;
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr auto ScaleShape() {
+        static_assert(N % BlockSize == 0u,
+                      "K must be whole 32-element scale groups");
+        return cute::make_shape(cute::Int<M>{}, cute::Int<N / BlockSize>{});
+    }
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
+        constexpr auto kShape = ScaleShape<M, N>();
+        return static_cast<std::uint32_t>(cute::get<0>(kShape)) *
+               static_cast<std::uint32_t>(cute::get<1>(kShape)) *
+               static_cast<std::uint32_t>(sizeof(ScaleType));
+    }
+};
+
+template <std::uint32_t BlockSize>
+struct QuantSpec<QuantMethod::kMXFP4, BlockSize> {
+    static constexpr QuantMethod kMethod = QuantMethod::kMXFP4;
+    static constexpr std::uint32_t kBlockSize = 32u;
+    using ElementType = std::uint8_t;  // two FP4 values per byte
+    using ScaleType = std::uint8_t;
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr auto ScaleShape() {
+        static_assert(N % BlockSize == 0u,
+                      "K must be whole 32-element scale groups");
+        return cute::make_shape(cute::Int<M>{}, cute::Int<N / BlockSize>{});
+    }
+
+    template <std::uint32_t M, std::uint32_t N>
+    __host__ __device__ static constexpr std::uint32_t ScaleBytes() {
+        constexpr auto kShape = ScaleShape<M, N>();
+        return static_cast<std::uint32_t>(cute::get<0>(kShape)) *
+               static_cast<std::uint32_t>(cute::get<1>(kShape)) *
+               static_cast<std::uint32_t>(sizeof(ScaleType));
+    }
 };
 
 template <bool UseLatent = true,
-          QuantMode LatentQuant = QuantMode::kBlockwiseFP8>
+          QuantMethod LatentQuant = QuantMethod::kBlockwiseFP8>
 struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr uint32_t kHiddenSize = 4096;
     static constexpr uint32_t kIntermediateSize = 512;
@@ -47,10 +136,9 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
     static constexpr uint32_t kNumTokens = 8;
     static constexpr uint32_t kNumExperts = 512;
     static constexpr uint32_t kMaxTopk = 10;
-    static constexpr uint32_t kQuantBlockM = 128;
-    static constexpr uint32_t kQuantBlockK = 128;
+    static constexpr uint32_t kQuantBlock = 128;
     static constexpr bool kUseLatent = UseLatent;
-    static constexpr QuantMode kLatentQuant = LatentQuant;
+    static constexpr QuantMethod kLatentQuant = LatentQuant;
     static constexpr std::uint32_t kNumRouterGates = 2;
     struct KernelConfig {
         static constexpr std::uint32_t kBlockSize = 384;
@@ -84,7 +172,7 @@ struct Dims_BS8_E512_N512_K2048_SM100 {
 };
 
 template <bool UseLatent = true,
-          QuantMode LatentQuant = QuantMode::kBlockwiseFP8>
+          QuantMethod LatentQuant = QuantMethod::kBlockwiseFP8>
 struct Dims_BS16_E512_N512_K2048_SM100
     : Dims_BS8_E512_N512_K2048_SM100<UseLatent, LatentQuant> {
     static constexpr uint32_t kNumTokens = 16;
