@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <cuda.h>
 #include <cuda_bf16.h>
 
 #include <cstddef>
@@ -23,7 +22,6 @@
 
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
-#include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
 
 namespace halops::moe {
@@ -40,32 +38,6 @@ __device__ static inline float warp_reduce_max_float(float value) {
     }
     return value;
 #endif
-}
-
-// Issue the full per-block BF16 input TMA load: one 64-k SW128 box per
-// issue, box `kk` into `dest[kk]`.
-template <std::size_t NumRows, std::size_t NumSwizzleBoxesK,
-          std::size_t SwizzleBoxK>
-__device__ __forceinline__ void load_input_tile(
-    CUtensorMap const& tma_input_desc, std::uint32_t tile,
-    std::uint32_t token_start,
-    DataType::ElementA (&dest)[NumSwizzleBoxesK][NumRows][SwizzleBoxK],
-    std::uint64_t* bar_smem_ptr) {
-    // The box is one 8-row swizzle atom, so the ring's rows are whole atoms.
-    constexpr std::uint32_t kRowGroups = NumRows / 8u;
-    static_assert(NumRows % 8u == 0u, "the ring is whole swizzle atoms");
-#pragma unroll
-    for (std::uint32_t kk = 0u; kk < NumSwizzleBoxesK; ++kk) {
-#pragma unroll
-        for (std::uint32_t g = 0u; g < kRowGroups; ++g) {
-            const std::uint32_t k_start =
-                tile * (NumSwizzleBoxesK * SwizzleBoxK) + kk * SwizzleBoxK;
-            tma_load_bf16_input_tile(tma_input_desc, k_start,
-                                     token_start + 8u * g,
-                                     /*dest_smem_ptr=*/&dest[kk][8u * g][0],
-                                     /*bar_smem_ptr=*/bar_smem_ptr);
-        }
-    }
 }
 
 // Reinterprets the bit-pattern of `x` to type `To`

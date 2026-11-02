@@ -21,7 +21,6 @@
 
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_cta_comm.cuh"
-#include "kernel/moe/moe_input.cuh"
 #include "kernel/moe/moe_mainloop_down.cuh"
 #include "kernel/moe/moe_mainloop_latent.cuh"
 #include "kernel/moe/moe_mainloop_router.cuh"
@@ -32,6 +31,7 @@
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
+#include "kernel/moe/quant_utils.cuh"
 
 namespace halops::moe {
 
@@ -82,7 +82,7 @@ struct CollectiveMainloopMoE {
 
     // Device-side launch parameters.
     struct Params {
-        const DataType::ElementA* __restrict__ activations_in;
+        const DataType::ElementA* __restrict__ input;
         std::uint32_t token_count;
         const typename Traits::RouterGemm::
             MmaElement* __restrict__ router_weight;
@@ -122,7 +122,7 @@ struct CollectiveMainloopMoE {
     // Builds the device parameters, including the four TMA descriptors.
     static Params to_underlying_arguments(Arguments const& args) {
         Params params{};
-        params.activations_in = args.input;
+        params.input = args.input;
         params.token_count = args.num_tokens;
         params.router_weight = args.router_weight;
         params.expert_weights_up = args.expert_up_weights;
@@ -163,77 +163,75 @@ struct CollectiveMainloopMoE {
                       Traits::kExpertWeightBytes)
                 : 0xFFFFFFFFu;
 
-        params.tma_up_weights_desc = CreateUpWeightTmaDesc(
-            reinterpret_cast<const void*>(args.expert_up_weights),
-            Dims::kNumExperts, Dims::kIntermediateSize,
-            MoEInputSize<Dims>::value);
-        // Row extent = the REAL token count: the TMA engine bounds-checks
-        // against globalDim and zero-fills out-of-bounds box rows.
-        // The box is one 8-row swizzle atom; a ring taller than that issues
-        // one box per atom.
-        params.tma_input_desc = CreateActivationsTmaDesc(
-            reinterpret_cast<const void*>(args.input), args.num_tokens,
-            /*box_rows=*/8u, Dims::kHiddenSize);
+        params.tma_up_weights_desc = CreateTmaDesc2D(
+            "up-projection weights", args.expert_up_weights,
+            /*rows=*/Dims::kNumExperts * 2u * Dims::kIntermediateSize,
+            /*cols=*/MoEInputSize<Dims>::value, /*box_rows=*/128u,
+            /*box_cols=*/128u);
+        params.tma_input_desc = CreateTmaDesc2D(
+            "activations", args.input, args.num_tokens, Dims::kHiddenSize,
+            /*box_rows=*/8u, /*box_cols=*/64u);
         if constexpr (Traits::kUseLatent && !Traits::kLatentQuantizeOutput) {
-            params.tma_latent_out_desc = CreateActivationsTmaDesc(
-                reinterpret_cast<const void*>(
-                    reinterpret_cast<Workspace*>(args.workspace)
-                        ->latent_down_out.data_ptr()),
-                Dims::kNumTokens, /*box_rows=*/8u, Dims::kLatentSize);
+            params.tma_latent_out_desc = CreateTmaDesc2D(
+                "activations",
+                reinterpret_cast<Workspace*>(args.workspace)
+                    ->latent_down_out.data_ptr(),
+                Dims::kNumTokens, Dims::kLatentSize, /*box_rows=*/8u,
+                /*box_cols=*/64u);
         }
         // box_rows pinned to 128: the down tile's M can exceed the
         // 256-row boxDim cap.
-        params.tma_down_weights_desc = CreateDownWeightTmaDesc(
-            reinterpret_cast<const void*>(args.expert_down_weights),
-            Dims::kNumExperts, MoEInputSize<Dims>::value,
-            Dims::kIntermediateSize,
-            /*box_rows=*/128u);
-        // The down activations live inside the scratchpad at
-        // kUpOutFp8Offset.
-        params.tma_down_activations_desc = CreateDownActivationTmaDesc(
-            reinterpret_cast<const char*>(args.workspace) +
-                Workspace::kUpOutFp8Offset,
-            Workspace::kMaxRoutedRows, Dims::kNumTokens,
-            Dims::kIntermediateSize);
+        params.tma_down_weights_desc = CreateTmaDesc2D(
+            "down-projection weights", args.expert_down_weights,
+            /*rows=*/Dims::kNumExperts * MoEInputSize<Dims>::value,
+            /*cols=*/Dims::kIntermediateSize, /*box_rows=*/128u,
+            /*box_cols=*/128u);
+        params.tma_down_activations_desc =
+            CreateTmaDesc2D("down-projection activations",
+                            reinterpret_cast<const DataType::ElementW*>(
+                                static_cast<const char*>(args.workspace) +
+                                Workspace::kUpOutFp8Offset),
+                            Workspace::kMaxRoutedRows, Dims::kIntermediateSize,
+                            /*box_rows=*/Dims::kNumTokens, /*box_cols=*/128u);
         if constexpr (Traits::kUseSharedExpert) {
             if (args.shared_out != nullptr) {
-                params.tma_shared_up_desc = CreateUpWeightTmaDesc(
-                    reinterpret_cast<const void*>(args.shared_up_weight),
-                    /*num_experts=*/1u, Dims::kIntermediateSize,
-                    Dims::kHiddenSize, SharedUpGemmTraits<Dims>::kTileShapeM);
-                params.tma_shared_down_desc = CreateDownWeightTmaDesc(
-                    reinterpret_cast<const void*>(args.shared_down_weight),
-                    /*num_experts=*/1u, Dims::kHiddenSize,
-                    Dims::kIntermediateSize,
-                    /*box_rows=*/SharedDownGemmTraits<Dims>::kTileShapeM);
+                params.tma_shared_up_desc = CreateTmaDesc2D(
+                    "up-projection weights", args.shared_up_weight,
+                    /*rows=*/Dims::kIntermediateSize * 2u,
+                    /*cols=*/Dims::kHiddenSize,
+                    /*box_rows=*/SharedUpGemmTraits<Dims>::kTileShapeM,
+                    /*box_cols=*/128u);
+                params.tma_shared_down_desc = CreateTmaDesc2D(
+                    "down-projection weights", args.shared_down_weight,
+                    /*rows=*/Dims::kHiddenSize,
+                    /*cols=*/Dims::kIntermediateSize,
+                    /*box_rows=*/SharedDownGemmTraits<Dims>::kTileShapeM,
+                    /*box_cols=*/128u);
             }
         }
         if (args.latent_down_weight != nullptr) {
-            params.tma_latent_down_weight_desc = CreateLatentDownWeightTmaDesc(
-                reinterpret_cast<const void*>(args.latent_down_weight),
+            params.tma_latent_down_weight_desc = CreateTmaDesc2D(
+                "latent-projection weights", args.latent_down_weight,
                 Dims::kLatentSize, Dims::kHiddenSize,
-                Traits::LatentDownGemm::kTileShapeM);
+                /*box_rows=*/Traits::LatentDownGemm::kTileShapeM,
+                /*box_cols=*/128u);
         }
         if (args.latent_down_weight_scale != nullptr) {
             if constexpr (Dims::kLatentQuant == QuantMethod::kMXFP8) {
-                params.tma_latent_down_scale_desc =
-                    CreateLatentDownScaleTmaDesc(
-                        reinterpret_cast<const void*>(
-                            args.latent_down_weight_scale),
-                        CU_TENSOR_MAP_DATA_TYPE_UINT8, Dims::kLatentSize,
-                        Dims::kHiddenSize / 32u, /*box_rows=*/32u,
-                        /*box_cols=*/Dims::kHiddenSize / 32u);
+                params.tma_latent_down_scale_desc = CreateTmaDesc2D(
+                    "latent-projection scales", args.latent_down_weight_scale,
+                    Dims::kLatentSize, Dims::kHiddenSize / 32u,
+                    /*box_rows=*/32u, /*box_cols=*/Dims::kHiddenSize / 32u,
+                    /*use_swizzle=*/false);
             } else {
-                params.tma_latent_down_scale_desc =
-                    CreateLatentDownScaleTmaDesc(
-                        reinterpret_cast<const void*>(
-                            args.latent_down_weight_scale),
-                        CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
-                        Dims::kLatentSize / Dims::kQuantBlock,
-                        Dims::kHiddenSize / Dims::kQuantBlock,
-                        /*box_rows=*/1u,
-                        /*box_cols=*/Dims::kHiddenSize / Dims::kQuantBlock /
-                            Traits::LatentDownGemm::kNumSplits);
+                params.tma_latent_down_scale_desc = CreateTmaDesc2D(
+                    "latent-projection scales", args.latent_down_weight_scale,
+                    Dims::kLatentSize / Dims::kQuantBlock,
+                    Dims::kHiddenSize / Dims::kQuantBlock,
+                    /*box_rows=*/1u,
+                    /*box_cols=*/Dims::kHiddenSize / Dims::kQuantBlock /
+                        Traits::LatentDownGemm::kNumSplits,
+                    /*use_swizzle=*/false);
             }
         }
         return params;
@@ -552,12 +550,12 @@ struct CollectiveMainloopMoE {
                       "the projection's output must be exactly one up "
                       "staging tile.");
         smem->barriers.latent_copy_ready.arrive(0u, kFp8Bytes + kScaleBytes);
-        tma_load_bulk(workspace->latent_down_out.data_ptr(), kFp8Bytes,
-                      &smem->routed_experts.quantized_input.data[0][0][0][0],
-                      smem->barriers.latent_copy_ready.raw(0u));
-        tma_load_bulk(workspace->latent_down_out.scale_ptr(), kScaleBytes,
-                      &smem->routed_experts.quantized_input.scale[0][0],
-                      smem->barriers.latent_copy_ready.raw(0u));
+        tma_load_1d(workspace->latent_down_out.data_ptr(), kFp8Bytes,
+                    &smem->routed_experts.quantized_input.data[0][0][0][0],
+                    smem->barriers.latent_copy_ready.raw(0u));
+        tma_load_1d(workspace->latent_down_out.scale_ptr(), kScaleBytes,
+                    &smem->routed_experts.quantized_input.scale[0][0],
+                    smem->barriers.latent_copy_ready.raw(0u));
         smem->barriers.latent_copy_ready.wait(0u);
         // Every K tile of the staging is complete at once.
         for (std::uint32_t tile = 0; tile < Traits::UpGemm::kNumTilesK;
@@ -590,10 +588,10 @@ struct CollectiveMainloopMoE {
                     params.token_count * Dims::kLatentSize *
                     static_cast<std::uint32_t>(sizeof(DataType::ElementA));
                 smem->barriers.latent_copy_ready.arrive(0u, kBytes);
-                tma_load_bulk(workspace->latent_down_out.data_ptr(), kBytes,
-                              reinterpret_cast<DataType::ElementA*>(
-                                  &smem->routed_experts.input.data[0][0][0]),
-                              smem->barriers.latent_copy_ready.raw(0u));
+                tma_load_1d(workspace->latent_down_out.data_ptr(), kBytes,
+                            reinterpret_cast<DataType::ElementA*>(
+                                &smem->routed_experts.input.data[0][0][0]),
+                            smem->barriers.latent_copy_ready.raw(0u));
             } else if constexpr (Traits::kUseLatent) {
                 run_load_up_input_k_loop(params.tma_latent_out_desc,
                                          Traits::UpGemm::kNumTilesK, smem);
@@ -625,8 +623,8 @@ struct CollectiveMainloopMoE {
             params.expert_scales_up, params.token_count, params.activation,
             GatedActParams{params.situ_beta, params.situ_linear_beta},
             workspace, smem, params.tma_up_weights_desc, sched,
-            expert_weight_cache_hint(smem->routing.active_expert_count >
-                                     params.expert_weight_l2_capacity));
+            get_tma_cache_hint(smem->routing.active_expert_count >
+                               params.expert_weight_l2_capacity));
     }
 
     // Phase 3: down-projection over this block's tasks, as enumerated by
@@ -639,8 +637,8 @@ struct CollectiveMainloopMoE {
             reinterpret_cast<Workspace*>(params.scratchpad), smem,
             params.tma_down_weights_desc, params.tma_down_activations_desc,
             sched,
-            expert_weight_cache_hint(smem->routing.active_expert_count >
-                                     params.expert_weight_l2_capacity));
+            get_tma_cache_hint(smem->routing.active_expert_count >
+                               params.expert_weight_l2_capacity));
     }
 
     // Pulls the TMA descriptors into the descriptor cache, so the first TMA of

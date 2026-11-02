@@ -24,13 +24,13 @@
 
 #include "kernel/moe/mma_core.cuh"
 #include "kernel/moe/moe_configs.cuh"
-#include "kernel/moe/moe_input.cuh"
 #include "kernel/moe/moe_mainloop_up.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
 #include "kernel/moe/ptx_utils.cuh"
+#include "kernel/moe/quant_utils.cuh"
 
 namespace halops::moe {
 
@@ -543,16 +543,16 @@ struct SharedExpertProjection {
                                    : 0u);
             smem->barriers.shared_down_input_ready.arrive(k_iter_id,
                                                           kTotalBytes);
-            tma_load_bulk(&workspace->shared_up_out
-                               .data[k_iter_id * kDownActChunks][0][0],
-                          kInputBytes, &sh.act_down_input.data[ring][0][0][0],
-                          smem->barriers.shared_down_input_ready.raw(ring));
+            tma_load_1d(&workspace->shared_up_out
+                             .data[k_iter_id * kDownActChunks][0][0],
+                        kInputBytes, &sh.act_down_input.data[ring][0][0][0],
+                        smem->barriers.shared_down_input_ready.raw(ring));
             if (k_iter_id == 0u) {
-                tma_load_bulk(workspace->shared_up_out.scale_ptr(),
-                              static_cast<std::uint32_t>(
-                                  sizeof(workspace->shared_up_out.scale)),
-                              &sh.act_down_input.scale[0][0],
-                              smem->barriers.shared_down_input_ready.raw(ring));
+                tma_load_1d(workspace->shared_up_out.scale_ptr(),
+                            static_cast<std::uint32_t>(
+                                sizeof(workspace->shared_up_out.scale)),
+                            &sh.act_down_input.scale[0][0],
+                            smem->barriers.shared_down_input_ready.raw(ring));
             }
         }
     }

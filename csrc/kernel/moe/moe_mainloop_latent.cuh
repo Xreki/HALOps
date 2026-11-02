@@ -22,12 +22,12 @@
 
 #include "kernel/moe/mma_core.cuh"
 #include "kernel/moe/moe_configs.cuh"
-#include "kernel/moe/moe_input.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
 #include "kernel/moe/ptx_utils.cuh"
+#include "kernel/moe/quant_utils.cuh"
 
 namespace halops::moe {
 
@@ -153,11 +153,11 @@ struct LatentDownProjectionBase {
                 k_tile(local) * LatentDownGemm::kTileShapeK;
 #pragma unroll
             for (std::uint32_t h = 0; h < kQuantBlocksPerTile; ++h) {
-                tma_load_latent_down_weight_tile(
-                    tma_latent_down_weight_desc, row_base(),
-                    k_start + h * Dims::kQuantBlock,
-                    &smem->latent_down.w_latent_down[slot][h][0][0],
-                    smem->barriers.latent_down_weight_ready.raw(slot));
+                tma_load_2d(tma_latent_down_weight_desc,
+                            /*coord0=*/k_start + h * Dims::kQuantBlock,
+                            /*coord1=*/row_base(),
+                            &smem->latent_down.w_latent_down[slot][h][0][0],
+                            smem->barriers.latent_down_weight_ready.raw(slot));
             }
         }
     }
@@ -177,12 +177,15 @@ struct LatentDownProjectionBase {
         if (threadIdx.x != 0u) return;
         auto& bar = smem->barriers.latent_down_scale_ready;
         bar.arrive(0u, kScaleBytes);
-        tma_load_latent_down_scale_tile(
-            tma_latent_down_scale_desc, split_idx() * kScaleColsPerSplit,
-            LatentDownGemm::WeightQuant::kMethod == QuantMethod::kMXFP8
+        tma_load_2d(
+            tma_latent_down_scale_desc,
+            /*coord0=*/split_idx() * kScaleColsPerSplit,
+            /*coord1=*/LatentDownGemm::WeightQuant::kMethod ==
+                    QuantMethod::kMXFP8
                 ? row_base()
                 : tile_idx(),
-            &smem->latent_down.w_latent_down_scale[0][0], bar.raw(0u));
+            &smem->latent_down.w_latent_down_scale[0][0], bar.raw(0u),
+            static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_FIRST));
     }
 
     __device__ static void publish(Workspace* __restrict__ workspace,

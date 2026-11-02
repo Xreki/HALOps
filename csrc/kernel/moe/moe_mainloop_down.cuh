@@ -505,13 +505,15 @@ struct DownProjection {
 #pragma unroll
         for (std::uint32_t h = 0; h < DownGemm::MmaCore::kNumAtomMs; ++h) {
             constexpr std::uint32_t kAtomM = DownGemm::MmaCore::kAtomShapeM;
-            tma_load_down_umma_tile(
-                tma_down_weights_desc, expert_id,
-                /*K=*/DownGemm::kGemmM,
-                /*base_col=*/base_m + h * kAtomM,
-                /*k_start=*/k_iter_id * 128u,
-                &smem->routed_experts.w_down[slot][h * kAtomM][0],
-                smem->barriers.down_weight_ready.raw(slot), weight_cache_hint);
+            // coord0 = n, coord1 = row of `[E, k, n]`.
+            const std::uint32_t global_row =
+                expert_id * DownGemm::kGemmM + base_m + h * kAtomM;
+            tma_load_2d(tma_down_weights_desc,
+                        /*coord0=*/k_iter_id * 128u,
+                        /*coord1=*/global_row,
+                        &smem->routed_experts.w_down[slot][h * kAtomM][0],
+                        smem->barriers.down_weight_ready.raw(slot),
+                        weight_cache_hint);
         }
     }
 
@@ -524,9 +526,9 @@ struct DownProjection {
         std::uint32_t slot, std::uint32_t k_iter_id) {
         if (routed_count > 0u) {
             smem->barriers.activation_ready.arrive(slot, kDownActTxBytes);
-            tma_load_down_umma_activation_bulk(
-                tma_down_activations_desc, /*k_start=*/k_iter_id * 128u,
-                /*first_row=*/expert_start,
+            tma_load_2d(
+                tma_down_activations_desc, /*coord0=*/k_iter_id * 128u,
+                /*coord1=*/expert_start,
                 &smem->routed_experts.up_down_act.act_down_input[slot][0],
                 smem->barriers.activation_ready.raw(slot));
         }

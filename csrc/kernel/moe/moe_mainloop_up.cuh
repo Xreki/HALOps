@@ -26,13 +26,13 @@
 #include "kernel/moe/mma_core.cuh"
 #include "kernel/moe/moe_configs.cuh"
 #include "kernel/moe/moe_cta_comm.cuh"
-#include "kernel/moe/moe_input.cuh"
 #include "kernel/moe/moe_scheduler.cuh"
 #include "kernel/moe/moe_shared_storage.cuh"
 #include "kernel/moe/moe_tma.cuh"
 #include "kernel/moe/moe_traits.cuh"
 #include "kernel/moe/moe_workspace.cuh"
 #include "kernel/moe/ptx_utils.cuh"
+#include "kernel/moe/quant_utils.cuh"
 
 namespace halops::moe {
 
@@ -546,12 +546,16 @@ struct UpProjection {
         // SWIZZLE_128B caps a box at 128 B of K; a wider tile is many boxes.
         using MmaCore = typename UpGemm::MmaCore;
         const std::uint32_t k_start = k_tile * MmaCore::kTileShapeK;
+        // coord1 is the gate/up pair's row inside `[E, 2*n, k]`; an expert
+        // owns `kGemmM` rows.
+        const std::uint32_t global_row =
+            expert_id * UpGemm::kGemmM + weight_row_base;
 #pragma unroll 1
         for (std::uint32_t h = 0; h < MmaCore::kNumSwizzleBoxKs; ++h) {
-            tma_load_up_tcgen05_pair_tile(
-                tma_up_weights_desc, expert_id, Dims::kIntermediateSize,
-                weight_row_base, k_start + h * MmaCore::kSwizzleBoxK,
-                &smem->routed_experts.w_up[slot][h][0],
+            tma_load_2d(
+                tma_up_weights_desc,
+                /*coord0=*/k_start + h * MmaCore::kSwizzleBoxK,
+                /*coord1=*/global_row, &smem->routed_experts.w_up[slot][h][0],
                 smem->barriers.up_weight_ready.raw(slot), weight_cache_hint);
         }
     }
